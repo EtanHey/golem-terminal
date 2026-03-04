@@ -9,7 +9,7 @@ path = "src/main.rs"
 
 [features]
 default = []
-gui = ["dep:iced", "dep:futures", "dep:vt100", "dep:serde", "dep:serde_json", "dep:image"]
+gui = ["dep:iced", "dep:futures", "dep:vt100", "dep:serde", "dep:serde_json", "dep:image", "dep:tokio"]
 
 [dependencies]
 clap         = { version = "4", features = ["derive"] }
@@ -22,7 +22,7 @@ vt100        = { version = "0.16", optional = true }
 serde        = { version = "1", features = ["derive"], optional = true }
 serde_json   = { version = "1", optional = true }
 image        = { version = "0.25", optional = true, default-features = false, features = ["png"] }
-tokio        = { version = "1", features = ["rt-multi-thread"] }
+tokio        = { version = "1", features = ["rt-multi-thread"], optional = true }
 
 [profile.release]
 strip = true

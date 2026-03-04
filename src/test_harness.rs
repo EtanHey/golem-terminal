@@ -11,7 +11,11 @@
 //!   {"cmd":"send_input","data":"x"} or  {"cmd":"send_input","data":"x","slot":1}
 //!   {"cmd":"new_tab"}
 //!   {"cmd":"close_tab","slot":1}
+//!   {"cmd":"select_tab","slot":1}
+//!   {"cmd":"toggle_split"}
 //!   {"cmd":"slot_count"}
+//!   {"cmd":"active_tab"}
+//!   {"cmd":"split_status"}
 //!   {"cmd":"quit"}
 
 use crate::ui::Message;
@@ -27,10 +31,14 @@ pub struct SlotState {
     pub status: String,
     pub output_bytes: usize,
     pub content: String,
+    pub raw_output: Vec<u8>,
 }
 
 pub struct TestState {
     pub slots: Vec<SlotState>,
+    pub active_tab: usize,
+    pub split_active: bool,
+    pub split_secondary: usize,
     pub death_cries_enabled: bool, // kept for compat, unused
 }
 
@@ -94,7 +102,8 @@ pub fn start(shared: Arc<Mutex<TestState>>) -> Task<Message> {
                         // Commands that don't require a valid slot index.
                         let slot_free_cmd = matches!(
                             parsed.cmd.as_str(),
-                            "quit" | "slot_count" | "new_tab"
+                            "quit" | "slot_count" | "new_tab" | "toggle_split"
+                                | "active_tab" | "split_status"
                         );
                         if !slot_free_cmd {
                             let slot_count = shared.lock().unwrap().slots.len();
@@ -158,10 +167,10 @@ pub fn start(shared: Arc<Mutex<TestState>>) -> Task<Message> {
                             }
                             "output" => {
                                 let state = shared.lock().unwrap();
-                                let bytes = state.slots[parsed.slot].output_bytes;
+                                let hex = hex_encode(&state.slots[parsed.slot].raw_output);
                                 reply(
                                     &mut writer,
-                                    &format!("{{\"output_bytes\":{bytes}}}\n"),
+                                    &format!("{{\"output\":\"{hex}\"}}\n"),
                                 );
                             }
                             "new_tab" => {
@@ -174,11 +183,38 @@ pub fn start(shared: Arc<Mutex<TestState>>) -> Task<Message> {
                                     sender.send(Message::CloseTab(parsed.slot)),
                                 );
                             }
+                            "select_tab" => {
+                                let _ = futures::executor::block_on(
+                                    sender.send(Message::SelectTab(parsed.slot)),
+                                );
+                            }
+                            "toggle_split" => {
+                                let _ = futures::executor::block_on(
+                                    sender.send(Message::ToggleSplit),
+                                );
+                            }
                             "slot_count" => {
                                 let count = shared.lock().unwrap().slots.len();
                                 reply(
                                     &mut writer,
                                     &format!("{{\"slot_count\":{count}}}\n"),
+                                );
+                            }
+                            "active_tab" => {
+                                let state = shared.lock().unwrap();
+                                let tab = state.active_tab;
+                                reply(
+                                    &mut writer,
+                                    &format!("{{\"active_tab\":{tab}}}\n"),
+                                );
+                            }
+                            "split_status" => {
+                                let state = shared.lock().unwrap();
+                                let active = state.split_active;
+                                let secondary = state.split_secondary;
+                                reply(
+                                    &mut writer,
+                                    &format!("{{\"split_active\":{active},\"split_secondary\":{secondary}}}\n"),
                                 );
                             }
                             other => {

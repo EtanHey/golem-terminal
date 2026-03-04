@@ -63,6 +63,9 @@ const BRACKETED_PASTE_END: &str = "\x1b[201~";
 const KB: usize = 1024;
 const MB: usize = 1024 * 1024;
 
+// Output log cap (10 MB) — prevents OOM on long sessions
+const OUTPUT_LOG_MAX: usize = 10 * MB;
+
 // Mode badge
 const MODE_BADGE_FONT: f32 = 10.0;
 const MODE_BADGE_RADIUS: f32 = 3.0;
@@ -196,6 +199,11 @@ impl AgentSlot {
 
     pub fn append_output(&mut self, data: &[u8]) {
         self.output_log.extend_from_slice(data);
+        // Cap raw log to prevent OOM on long-running sessions.
+        if self.output_log.len() > OUTPUT_LOG_MAX {
+            let trim = self.output_log.len() - OUTPUT_LOG_MAX;
+            self.output_log.drain(..trim);
+        }
         self.vt_parser.process(data);
         self.rebuild_caches();
     }
@@ -247,12 +255,15 @@ impl AgentSlot {
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    match crate::session::spawn(cmd) {
+                    match crate::session::spawn_sized(cmd, VT_COLS, VT_ROWS) {
                         Ok(handle) => {
                             *mailbox.lock().unwrap() = Some((handle, vec![]));
                             slot
                         }
-                        Err(_) => slot,
+                        Err(e) => {
+                            eprintln!("[golem-terminal] spawn failed for slot {slot}: {e}");
+                            slot
+                        }
                     }
                 })
                 .await
@@ -373,18 +384,17 @@ fn compute_display_text(screen: &vt100::Screen, start: usize, end: usize) -> Str
         let mut display_lines: Vec<String> = result.lines().map(|l| l.to_string()).collect();
         if adjusted_row < display_lines.len() {
             let line = &mut display_lines[adjusted_row];
-            while line.len() < cursor_col {
-                line.push(' ');
+            let mut chars: Vec<char> = line.chars().collect();
+            // Pad with spaces if cursor is past end of line (using char count, not bytes).
+            while chars.len() < cursor_col {
+                chars.push(' ');
             }
-            if cursor_col < line.len() {
-                let mut chars: Vec<char> = line.chars().collect();
-                if cursor_col < chars.len() {
-                    chars[cursor_col] = '▋';
-                }
-                *line = chars.into_iter().collect();
+            if cursor_col < chars.len() {
+                chars[cursor_col] = '▋';
             } else {
-                line.push('▋');
+                chars.push('▋');
             }
+            *line = chars.into_iter().collect();
         }
         result = display_lines.join("\n");
     }
@@ -517,6 +527,9 @@ impl State {
 
         let test_state = Arc::new(Mutex::new(crate::test_harness::TestState {
             slots: vec![crate::test_harness::SlotState::default()],
+            active_tab: 0,
+            split_active: false,
+            split_secondary: 0,
             death_cries_enabled: false,
         }));
 
@@ -552,17 +565,24 @@ impl State {
         let mut ts = self.test_state.lock().unwrap();
         ts.slots.resize_with(self.slots.len(), Default::default);
         for (i, slot) in self.slots.iter().enumerate() {
-            ts.slots[i] = crate::test_harness::SlotState {
-                id: slot.id,
-                status: match &slot.status {
-                    AgentStatus::Idle => "idle".into(),
-                    AgentStatus::Pending => "pending".into(),
-                    AgentStatus::Ready(_) => "ready".into(),
-                },
-                output_bytes: slot.output_log.len(),
-                content: slot.content_text(),
+            ts.slots[i].id = slot.id;
+            ts.slots[i].status = match &slot.status {
+                AgentStatus::Idle => "idle".into(),
+                AgentStatus::Pending => "pending".into(),
+                AgentStatus::Ready(_) => "ready".into(),
             };
+            ts.slots[i].output_bytes = slot.output_log.len();
+            ts.slots[i].content = slot.content_text();
+            // Only update raw_output if size changed (avoid cloning on every message).
+            if ts.slots[i].raw_output.len() != slot.output_log.len() {
+                // Keep last 64 KB to avoid OOM in the shared state.
+                let start = slot.output_log.len().saturating_sub(64 * 1024);
+                ts.slots[i].raw_output = slot.output_log[start..].to_vec();
+            }
         }
+        ts.active_tab = self.active_tab;
+        ts.split_active = self.split_active;
+        ts.split_secondary = self.split_secondary;
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
