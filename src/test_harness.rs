@@ -129,12 +129,12 @@ pub fn start(shared: Arc<Mutex<TestState>>) -> Task<Message> {
                             }
                             "launch" => {
                                 let _ = futures::executor::block_on(
-                                    sender.send(Message::Launch(parsed.slot)),
+                                    sender.send(Message::LaunchSlot(parsed.slot)),
                                 );
                             }
                             "kill" => {
                                 let _ = futures::executor::block_on(
-                                    sender.send(Message::Kill(parsed.slot)),
+                                    sender.send(Message::KillSlot(parsed.slot)),
                                 );
                             }
                             "send_input" => {
