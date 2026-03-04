@@ -1,0 +1,30 @@
+[package]
+name = "golem-terminal"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "golem-terminal"
+path = "src/main.rs"
+
+[features]
+default = []
+gui = ["dep:iced", "dep:futures", "dep:vt100", "dep:serde", "dep:serde_json", "dep:image"]
+
+[dependencies]
+clap         = { version = "4", features = ["derive"] }
+portable-pty = "0.9"
+libc         = "0.2"
+anyhow       = "1"
+iced         = { version = "0.14", optional = true, features = ["image", "tokio"] }
+futures      = { version = "0.3",  optional = true }
+vt100        = { version = "0.16", optional = true }
+serde        = { version = "1", features = ["derive"], optional = true }
+serde_json   = { version = "1", optional = true }
+image        = { version = "0.25", optional = true, default-features = false, features = ["png"] }
+tokio        = { version = "1", features = ["rt-multi-thread"] }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
