@@ -1348,4 +1348,78 @@ mod tests {
         let content = state.slots[0].content_text();
         assert!(content.contains("hello"));
     }
+
+    #[test]
+    fn output_log_caps_at_max() {
+        let mut slot = AgentSlot::new(0, vec!["echo".into()], "t".into());
+        // Feed two chunks that together exceed OUTPUT_LOG_MAX.
+        let half_plus = OUTPUT_LOG_MAX / 2 + 1024;
+        slot.append_output(&vec![b'A'; half_plus]);
+        slot.append_output(&vec![b'B'; half_plus]);
+        assert!(
+            slot.output_log.len() <= OUTPUT_LOG_MAX,
+            "log must not exceed cap, got {}",
+            slot.output_log.len()
+        );
+        // The last byte should be from the B chunk (tail retained).
+        assert_eq!(
+            *slot.output_log.last().unwrap(), b'B',
+            "cap must retain tail bytes"
+        );
+        // Most of the log should be B's (the tail).
+        let b_count = slot.output_log.iter().filter(|&&b| b == b'B').count();
+        assert!(
+            b_count > slot.output_log.len() / 2,
+            "majority should be B's (tail), got {} B's out of {}",
+            b_count, slot.output_log.len()
+        );
+    }
+
+    #[test]
+    fn output_log_no_trim_when_under_cap() {
+        let mut slot = AgentSlot::new(0, vec!["echo".into()], "t".into());
+        slot.append_output(&[b'X'; 1024]);
+        assert_eq!(slot.output_log.len(), 1024);
+    }
+
+    #[test]
+    fn switch_tab_wraps_backward() {
+        let mut state = State::new(vec!["echo".into()]);
+        let _ = state.update(Message::NewTab);
+        let _ = state.update(Message::SelectTab(0));
+        assert_eq!(state.active_tab, 0);
+        let _ = state.update(Message::SwitchTab(-1));
+        assert_eq!(state.active_tab, 1, "SwitchTab(-1) from 0 should wrap to last");
+    }
+
+    #[test]
+    fn close_tab_clamps_active_tab() {
+        let mut state = State::new(vec!["echo".into()]);
+        let _ = state.update(Message::NewTab);
+        assert_eq!(state.active_tab, 1);
+        let _ = state.update(Message::CloseTab(1));
+        assert_eq!(state.active_tab, 0, "active_tab must clamp after closing last tab");
+    }
+
+    #[test]
+    fn close_tab_clamps_split_secondary() {
+        let mut state = State::new(vec!["echo".into()]);
+        let _ = state.update(Message::NewTab);
+        state.split_secondary = 1;
+        let _ = state.update(Message::CloseTab(1));
+        assert!(
+            state.split_secondary < state.slots.len(),
+            "split_secondary must clamp after tab removal"
+        );
+    }
+
+    #[test]
+    fn select_tab_changes_active() {
+        let mut state = State::new(vec!["echo".into()]);
+        let _ = state.update(Message::NewTab);
+        let _ = state.update(Message::NewTab);
+        assert_eq!(state.active_tab, 2);
+        let _ = state.update(Message::SelectTab(0));
+        assert_eq!(state.active_tab, 0);
+    }
 }

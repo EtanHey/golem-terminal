@@ -254,3 +254,23 @@ fn hex_encode(bytes: &[u8]) -> String {
     }
     s
 }
+
+#[cfg(test)]
+mod tests {
+    use super::hex_encode;
+
+    #[test]
+    fn hex_encode_empty() {
+        assert_eq!(hex_encode(&[]), "");
+    }
+
+    #[test]
+    fn hex_encode_known_bytes() {
+        assert_eq!(hex_encode(&[0xde, 0xad, 0xbe, 0xef]), "deadbeef");
+    }
+
+    #[test]
+    fn hex_encode_all_zeros() {
+        assert_eq!(hex_encode(&[0x00, 0x00]), "0000");
+    }
+}

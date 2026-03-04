@@ -37,18 +37,20 @@ def send_cmd(sock_path: str, payload: dict) -> dict:
     """Connect, send JSON command, read JSON response, close."""
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.settimeout(10)
-    sock.connect(sock_path)
-    msg = json.dumps(payload) + "\n"
-    sock.sendall(msg.encode())
-    buf = b""
-    while True:
-        chunk = sock.recv(4096)
-        if not chunk:
-            break
-        buf += chunk
-        if b"\n" in buf:
-            break
-    sock.close()
+    try:
+        sock.connect(sock_path)
+        msg = json.dumps(payload) + "\n"
+        sock.sendall(msg.encode())
+        buf = b""
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+            if b"\n" in buf:
+                break
+    finally:
+        sock.close()
     line = buf.decode(errors="replace").strip()
     if not line:
         return {}
@@ -62,12 +64,14 @@ def fire_and_forget(sock_path: str, payload: dict) -> None:
     """Send a command that has no response (launch, kill, etc.)."""
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.settimeout(5)
-    sock.connect(sock_path)
-    msg = json.dumps(payload) + "\n"
-    sock.sendall(msg.encode())
-    # Give the GUI a moment to process before closing.
-    time.sleep(0.1)
-    sock.close()
+    try:
+        sock.connect(sock_path)
+        msg = json.dumps(payload) + "\n"
+        sock.sendall(msg.encode())
+        # Give the GUI a moment to process before closing.
+        time.sleep(0.1)
+    finally:
+        sock.close()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -107,7 +111,7 @@ def take_screenshot(output_path: str = "/tmp/golem-terminal-screenshot.png") -> 
     # Small delay to let UI settle.
     time.sleep(0.5)
     subprocess.run(["screencapture", "-l",
-                     _get_window_id("Golem Terminal"), output_path],
+                     _get_window_id(), output_path],
                     capture_output=True)
     if os.path.exists(output_path):
         return output_path
@@ -116,13 +120,15 @@ def take_screenshot(output_path: str = "/tmp/golem-terminal-screenshot.png") -> 
     return output_path if os.path.exists(output_path) else ""
 
 
-def _get_window_id(title: str) -> str:
-    """Get macOS window ID by title (best effort)."""
+def _get_window_id() -> str:
+    """Get macOS window ID for Golem Terminal (hardcoded, safe)."""
     try:
+        script = (
+            'tell application "System Events" to get id of first window of '
+            '(first process whose name is "Golem Terminal")'
+        )
         result = subprocess.run(
-            ["osascript", "-e",
-             f'tell application "System Events" to get id of first window of '
-             f'(first process whose name is "{title}")'],
+            ["osascript", "-e", script],
             capture_output=True, text=True, timeout=5
         )
         return result.stdout.strip()
@@ -248,14 +254,18 @@ def demo_multi_claude(sock_path: str, n: int = 2) -> None:
     # Launch in tab 0.
     cmd_launch(sock_path, slot=0)
     print("Waiting for tab 0 to become ready...")
-    wait_for_status(sock_path, 0, "ready", timeout=30)
+    if not wait_for_status(sock_path, 0, "ready", timeout=30):
+        print("WARNING: tab 0 did not become ready in time")
+        return
 
     # Create additional tabs and launch.
     for i in range(1, n):
         idx = cmd_new_tab(sock_path)
         cmd_launch(sock_path, slot=idx)
         print(f"Waiting for tab {idx} to become ready...")
-        wait_for_status(sock_path, idx, "ready", timeout=30)
+        if not wait_for_status(sock_path, idx, "ready", timeout=30):
+            print(f"WARNING: tab {idx} did not become ready in time")
+            return
 
     # Toggle split-screen.
     if n >= 2:
@@ -355,11 +365,13 @@ def run_interactive() -> None:
                 # Parse "text [slot]" — last word might be slot number.
                 send_parts = rest.rsplit(None, 1)
                 if len(send_parts) == 2 and send_parts[1].isdigit():
-                    data = send_parts[0].encode().decode("unicode_escape")
+                    data = send_parts[0]
                     slot = int(send_parts[1])
                 else:
-                    data = rest.encode().decode("unicode_escape")
+                    data = rest
                     slot = 0
+                # Safe escape: only \r and \n, not arbitrary \x sequences.
+                data = data.replace("\\r", "\r").replace("\\n", "\n").replace("\\t", "\t")
                 cmd_send_input(sock_path, data, slot)
             elif cmd == "kill":
                 slot = int(rest) if rest else 0
