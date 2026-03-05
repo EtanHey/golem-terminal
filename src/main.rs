@@ -1,3 +1,4 @@
+mod config;
 mod pty;
 mod session;
 #[cfg(feature = "gui")]

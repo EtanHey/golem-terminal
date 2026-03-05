@@ -94,6 +94,9 @@ pub enum Message {
 
     // Sidebar
     ToggleSidebar,
+
+    // Config hot-reload
+    ConfigReloaded(crate::config::AppConfig),
 }
 
 // ── Agent Slot ───────────────────────────────────────────────────────────────
@@ -256,12 +259,17 @@ pub struct State {
     pub base_cmd: Vec<String>,
     pub next_slot_id: usize,
     pub test_state: Arc<Mutex<crate::test_harness::TestState>>,
+    pub config: crate::config::AppConfig,
     #[cfg(target_os = "macos")]
     vibrancy_applied: bool,
 }
 
 impl State {
     pub fn new(cmd: Vec<String>) -> Self {
+        // Load config (creates default if needed)
+        crate::config::ensure_default_config();
+        let config = crate::config::load().unwrap_or_default();
+
         let slot = AgentSlot::new(0, cmd.clone(), "Agent 1".into());
         let (panes, first_pane) = pane_grid::State::new(0_usize); // pane 0 → slot 0
 
@@ -281,6 +289,7 @@ impl State {
             base_cmd: cmd,
             next_slot_id: 1,
             test_state,
+            config,
             #[cfg(target_os = "macos")]
             vibrancy_applied: false,
         }
@@ -634,6 +643,13 @@ impl State {
                 Task::none()
             }
 
+            Message::ConfigReloaded(new_config) => {
+                eprintln!("[config] reloaded: {} golems, {} groups",
+                    new_config.golem.len(), new_config.groups.len());
+                self.config = new_config;
+                Task::none()
+            }
+
             Message::KeyboardIgnored => return Task::none(),
 
             Message::Quit => {
@@ -738,6 +754,11 @@ impl State {
             }
             _ => Message::KeyboardIgnored,
         }));
+
+        // Config file watcher for hot-reload
+        subscriptions.push(
+            crate::config::watch_config().map(Message::ConfigReloaded),
+        );
 
         Subscription::batch(subscriptions)
     }
