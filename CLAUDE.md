@@ -39,7 +39,7 @@ Tab-based terminal multiplexer for Claude Code orchestration. Built with Rust + 
 |---------|----------|-------------|
 | `launch` | (none) | Start iced_term terminal in slot |
 | `kill` | (none) | Kill terminal in slot |
-| `send_input` | (none) | No-op (iced_term backend is private) |
+| `send_input` | (none) | Send keystrokes to terminal in slot |
 | `status` | `{"status":"..."}` | idle/pending/ready |
 | `content` | `{"content":"hex"}` | Terminal content (hex) |
 | `output` | `{"output":"hex"}` | Raw output (hex) |
@@ -75,6 +75,7 @@ cargo test --features gui --test e2e_gui
 
 ## Known Limitations
 
-- `send_input` UDS command is no-op — iced_term's backend module is private, can't construct Write commands externally
+- ~~`send_input` UDS command is no-op~~ **FIXED** — forked iced_term (EtanHey/iced_term), made backend module pub. send_input now works.
+- ~~Pty::drop() blocks synchronously~~ **FIXED** — fork moves PTY shutdown to background thread, UI stays responsive.
 - Vibrancy/Liquid Glass deferred — requires objc FFI for sidebar-only NSVisualEffectView
 - Tab groups not yet implemented — all tabs in single "AGENTS" group

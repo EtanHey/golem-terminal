@@ -1724,8 +1724,7 @@ dependencies = [
 [[package]]
 name = "iced_term"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6f461d32a472194735c94901bf2fc70d493ee98a8b29e7e244f296c82826745"
+source = "git+https://github.com/EtanHey/iced_term?branch=feat%2Fpub-backend-async-drop#bda55e25e74166f8a4b9010576a659549108a4ce"
 dependencies = [
  "alacritty_terminal",
  "anyhow",

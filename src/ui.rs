@@ -327,11 +327,15 @@ impl State {
                 Task::none()
             }
 
-            Message::SendInput(_idx, _data) => {
-                // AIDEV-TODO: iced_term's backend module is private, so we can't
-                // construct Write commands directly. Input goes through iced_term's
-                // keyboard handling natively. Test harness send_input needs iced_term
-                // fork or upstream PR to expose backend::Command::Write.
+            Message::SendInput(idx, data) => {
+                if let Some(slot) = self.slots.get_mut(idx) {
+                    if let Some(ref mut terminal) = slot.terminal {
+                        let cmd = iced_term::Command::ProxyToBackend(
+                            iced_term::backend::Command::Write(data.into_bytes()),
+                        );
+                        terminal.handle(cmd);
+                    }
+                }
                 Task::none()
             }
 
