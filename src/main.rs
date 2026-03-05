@@ -49,8 +49,7 @@ fn main() -> anyhow::Result<()> {
                 let cfg = config::load().unwrap_or_default();
                 let mut shell_cmd = vec![cfg.shell.program];
                 shell_cmd.extend(cfg.shell.args);
-                shell_cmd
-            } else {
+                shell_cmd            } else {
                 cmd
             };
             ui::run(cmd)
