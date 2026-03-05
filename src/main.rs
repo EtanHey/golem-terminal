@@ -45,7 +45,7 @@ fn main() -> anyhow::Result<()> {
         #[cfg(feature = "gui")]
         Commands::Ui { cmd } => {
             let cmd = if cmd.is_empty() {
-                vec!["claude".into(), "--dangerously-skip-permissions".into()]
+                vec!["/bin/zsh".into(), "-l".into()]
             } else {
                 cmd
             };

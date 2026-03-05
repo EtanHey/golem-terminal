@@ -230,7 +230,7 @@ fn gui_shortcut_bindings() -> Vec<(Binding<InputKind>, BindingAction)> {
     };
 
     vec![
-        swallow("d", cmd),       // Cmd+D → split horizontal
+        swallow("d", cmd),       // Cmd+D → toggle split
         swallow("d", cmd_shift), // Cmd+Shift+D → split vertical
         swallow("b", cmd),       // Cmd+B → toggle sidebar
         swallow("t", cmd),       // Cmd+T → new tab
@@ -344,13 +344,14 @@ impl State {
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         // Apply vibrancy on first update (window now exists, we're on main thread)
+        // DISABLED: vibrancy applies to entire content view, making terminal grey.
+        // Needs per-subview vibrancy (sidebar only) — Phase 2 task.
         #[cfg(target_os = "macos")]
         if !self.vibrancy_applied {
             self.vibrancy_applied = true;
-            // Only apply in GUI mode (MainThreadMarker::new() returns None in tests)
-            if objc2::MainThreadMarker::new().is_some() {
-                apply_macos_vibrancy();
-            }
+            // if objc2::MainThreadMarker::new().is_some() {
+            //     apply_macos_vibrancy();
+            // }
         }
 
         let task = match message {
@@ -548,24 +549,35 @@ impl State {
                             }
                         }
                     }
-                } else if self.slots.len() > 1 {
-                    // Only 1 pane, multiple slots → split and show a second slot
-                    if let Some(focused) = self.focus {
-                        let current = self.active_slot_idx().unwrap_or(0);
+                } else if let Some(focused) = self.focus {
+                    // Only 1 pane → split vertically with a second slot
+                    let secondary = if self.slots.len() > 1 {
                         // Pick the first slot not currently shown
-                        let secondary = (0..self.slots.len())
+                        let current = self.active_slot_idx().unwrap_or(0);
+                        (0..self.slots.len())
                             .find(|&i| i != current)
-                            .unwrap_or(0);
-                        if let Some((new_pane, _)) = self.panes.split(
-                            pane_grid::Axis::Vertical,
-                            focused,
-                            secondary,
-                        ) {
-                            self.focus = Some(new_pane);
-                            if let Some(ref term) = self.slots[secondary].terminal {
-                                self.sync_test_state();
-                                return TerminalView::focus(term.widget_id().clone());
-                            }
+                            .unwrap_or(0)
+                    } else {
+                        // Create a new slot
+                        let id = self.next_slot_id;
+                        self.next_slot_id += 1;
+                        let label = format!("Agent {}", id + 1);
+                        let slot = AgentSlot::new(id, self.base_cmd.clone(), label);
+                        self.slots.push(slot);
+                        let mut ts = self.test_state.lock().unwrap();
+                        ts.slots.push(crate::test_harness::SlotState::default());
+                        drop(ts);
+                        self.slots.len() - 1
+                    };
+                    if let Some((new_pane, _)) = self.panes.split(
+                        pane_grid::Axis::Vertical,
+                        focused,
+                        secondary,
+                    ) {
+                        self.focus = Some(new_pane);
+                        if let Some(ref term) = self.slots[secondary].terminal {
+                            self.sync_test_state();
+                            return TerminalView::focus(term.widget_id().clone());
                         }
                     }
                 }
@@ -595,9 +607,18 @@ impl State {
                 self.focus = Some(pane);
                 if let Some(&slot_idx) = self.panes.get(pane) {
                     if slot_idx < self.slots.len() {
+                        // If terminal is running, focus it
                         if let Some(ref term) = self.slots[slot_idx].terminal {
                             self.sync_test_state();
                             return TerminalView::focus(term.widget_id().clone());
+                        }
+                        // If idle, launch it
+                        if self.slots[slot_idx].status == SlotStatus::Idle {
+                            self.slots[slot_idx].launch();
+                            if let Some(ref term) = self.slots[slot_idx].terminal {
+                                self.sync_test_state();
+                                return TerminalView::focus(term.widget_id().clone());
+                            }
                         }
                     }
                 }
@@ -616,10 +637,10 @@ impl State {
 
             Message::PaneDragged(_) => Task::none(),
 
-            Message::TermEvent(iced_term::Event::BackendCall(id, cmd)) => {
+            Message::TermEvent(iced_term::Event::BackendCall(id, ref cmd)) => {
                 if let Some(slot) = self.slots.iter_mut().find(|s| s.id as u64 == id) {
                     if let Some(ref mut term) = slot.terminal {
-                        let action = term.handle(iced_term::Command::ProxyToBackend(cmd));
+                        let action = term.handle(iced_term::Command::ProxyToBackend(cmd.clone()));
                         if action == iced_term::actions::Action::Shutdown {
                             slot.terminal = None;
                             slot.status = SlotStatus::Idle;
@@ -710,13 +731,13 @@ impl State {
                 modifiers,
                 ..
             } if c.as_ref() == "t" && modifiers.command() => Message::NewTab,
-            // Cmd+D → split horizontal
+            // Cmd+D → toggle split (1 pane ↔ 2 panes side-by-side)
             keyboard::Event::KeyPressed {
                 key: keyboard::Key::Character(ref c),
                 modifiers,
                 ..
             } if c.as_ref() == "d" && modifiers.command() => {
-                Message::SplitFocused(pane_grid::Axis::Horizontal)
+                Message::ToggleSplit
             }
             // Cmd+W → close pane
             keyboard::Event::KeyPressed {
@@ -836,6 +857,10 @@ impl State {
             )
             .width(Length::Fill)
             .height(Length::Fill)
+            .style(|_theme| container::Style {
+                background: Some(iced::Background::Color(BG_PRIMARY)),
+                ..Default::default()
+            })
             .into()
         } else {
             // Idle state — show launch prompt
@@ -1102,7 +1127,7 @@ pub fn run(cmd: Vec<String>) -> anyhow::Result<()> {
         win.platform_specific.title_hidden = true;
         win.platform_specific.titlebar_transparent = true;
         win.platform_specific.fullsize_content_view = true;
-        win.transparent = true; // Required for vibrancy to show through
+        // win.transparent = true; // TEMPORARILY DISABLED for debugging
     }
 
     iced::application(
@@ -1115,6 +1140,7 @@ pub fn run(cmd: Vec<String>) -> anyhow::Result<()> {
         State::view,
     )
     .subscription(State::subscription)
+    .theme(|_: &State| iced::Theme::Dark)
     .title("Golem Terminal")
     .window(win)
     .run()
