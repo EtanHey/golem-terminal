@@ -54,6 +54,78 @@ pub struct AppConfig {
     pub golem: Vec<GolemConfig>,
     #[serde(default)]
     pub groups: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    pub ui: UiConfig,
+    #[serde(default)]
+    pub shell: ShellConfig,
+}
+
+// ── UI Config ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UiConfig {
+    #[serde(default = "default_sidebar_width")]
+    pub sidebar_width: f32,
+    #[serde(default = "default_bottom_bar_height")]
+    pub bottom_bar_height: f32,
+    #[serde(default = "default_pane_spacing")]
+    pub pane_spacing: f32,
+    #[serde(default)]
+    pub font: FontConfig,
+    #[serde(default)]
+    pub colors: ColorConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FontConfig {
+    #[serde(default = "default_font_small")]
+    pub small: f32,
+    #[serde(default = "default_font_tiny")]
+    pub tiny: f32,
+    #[serde(default = "default_font_tab")]
+    pub tab: f32,
+    #[serde(default = "default_font_group")]
+    pub group: f32,
+    #[serde(default = "default_font_terminal")]
+    pub terminal: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ColorConfig {
+    #[serde(default = "default_bg_primary")]
+    pub bg_primary: String,
+    #[serde(default = "default_bg_secondary")]
+    pub bg_secondary: String,
+    #[serde(default = "default_bg_sidebar")]
+    pub bg_sidebar: String,
+    #[serde(default = "default_bg_tab_active")]
+    pub bg_tab_active: String,
+    #[serde(default = "default_bg_tab_hover")]
+    pub bg_tab_hover: String,
+    #[serde(default = "default_accent")]
+    pub accent: String,
+    #[serde(default = "default_text_secondary")]
+    pub text_secondary: String,
+    #[serde(default = "default_text_tab_active")]
+    pub text_tab_active: String,
+    #[serde(default = "default_status_running")]
+    pub status_running: String,
+    #[serde(default = "default_status_pending")]
+    pub status_pending: String,
+    #[serde(default = "default_status_idle")]
+    pub status_idle: String,
+    #[serde(default = "default_focus_border")]
+    pub focus_border: String,
+}
+
+// ── Shell Config ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ShellConfig {
+    #[serde(default = "default_shell_program")]
+    pub program: String,
+    #[serde(default = "default_shell_args")]
+    pub args: Vec<String>,
 }
 
 // ── Defaults ─────────────────────────────────────────────────────────────────
@@ -70,13 +142,121 @@ fn default_golem_type() -> GolemType {
     GolemType::Worker
 }
 
+// UI layout defaults
+fn default_sidebar_width() -> f32 { 200.0 }
+fn default_bottom_bar_height() -> f32 { 24.0 }
+fn default_pane_spacing() -> f32 { 2.0 }
+
+// Font defaults
+fn default_font_small() -> f32 { 12.0 }
+fn default_font_tiny() -> f32 { 10.0 }
+fn default_font_tab() -> f32 { 13.0 }
+fn default_font_group() -> f32 { 11.0 }
+fn default_font_terminal() -> f32 { 14.0 }
+
+// Color defaults (hex strings matching current hardcoded iced::Color values)
+fn default_bg_primary() -> String { "#1c1c24".into() }
+fn default_bg_secondary() -> String { "#262631".into() }
+fn default_bg_sidebar() -> String { "#1f1f26".into() }
+fn default_bg_tab_active() -> String { "#2e2e38".into() }
+fn default_bg_tab_hover() -> String { "#292933".into() }
+fn default_accent() -> String { "#6699f2".into() }
+fn default_text_secondary() -> String { "#8c8c99".into() }
+fn default_text_tab_active() -> String { "#f2f2f2".into() }
+fn default_status_running() -> String { "#4dcc66".into() }
+fn default_status_pending() -> String { "#e6b333".into() }
+fn default_status_idle() -> String { "#737380".into() }
+fn default_focus_border() -> String { "#598ce6".into() }
+
+// Shell defaults
+fn default_shell_program() -> String { "/bin/zsh".into() }
+fn default_shell_args() -> Vec<String> { vec!["-l".into()] }
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
             golem: vec![],
             groups: HashMap::new(),
+            ui: UiConfig::default(),
+            shell: ShellConfig::default(),
         }
     }
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            sidebar_width: default_sidebar_width(),
+            bottom_bar_height: default_bottom_bar_height(),
+            pane_spacing: default_pane_spacing(),
+            font: FontConfig::default(),
+            colors: ColorConfig::default(),
+        }
+    }
+}
+
+impl Default for FontConfig {
+    fn default() -> Self {
+        Self {
+            small: default_font_small(),
+            tiny: default_font_tiny(),
+            tab: default_font_tab(),
+            group: default_font_group(),
+            terminal: default_font_terminal(),
+        }
+    }
+}
+
+impl Default for ColorConfig {
+    fn default() -> Self {
+        Self {
+            bg_primary: default_bg_primary(),
+            bg_secondary: default_bg_secondary(),
+            bg_sidebar: default_bg_sidebar(),
+            bg_tab_active: default_bg_tab_active(),
+            bg_tab_hover: default_bg_tab_hover(),
+            accent: default_accent(),
+            text_secondary: default_text_secondary(),
+            text_tab_active: default_text_tab_active(),
+            status_running: default_status_running(),
+            status_pending: default_status_pending(),
+            status_idle: default_status_idle(),
+            focus_border: default_focus_border(),
+        }
+    }
+}
+
+impl Default for ShellConfig {
+    fn default() -> Self {
+        Self {
+            program: default_shell_program(),
+            args: default_shell_args(),
+        }
+    }
+}
+
+// ── Hex Color Parsing ───────────────────────────────────────────────────────
+
+/// Parse a hex color string (e.g. "#1b1b1f" or "1b1b1f") into an iced::Color.
+/// Falls back to magenta on invalid input for easy visual debugging.
+#[cfg(feature = "gui")]
+pub fn parse_hex_color(hex: &str) -> iced::Color {
+    let hex = hex.strip_prefix('#').unwrap_or(hex);
+    if hex.len() != 6 {
+        return iced::Color::from_rgb(1.0, 0.0, 1.0); // magenta = broken
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(255);
+    let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(0);
+    let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(255);
+    iced::Color::from_rgb(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0)
+}
+
+/// Parse hex color with custom alpha (for sidebar vibrancy).
+#[cfg(feature = "gui")]
+pub fn parse_hex_color_alpha(hex: &str, alpha: f32) -> iced::Color {
+    let mut c = parse_hex_color(hex);
+    c.a = alpha;
+    c
 }
 
 // ── Load Config ──────────────────────────────────────────────────────────────
@@ -135,6 +315,38 @@ pub fn ensure_default_config() {
 # [groups]
 # orchestrators = ["orcClaude"]
 # workers = ["brainClaude", "golemsClaude"]
+
+# ── Shell ──────────────────────────────────────────
+# [shell]
+# program = "/bin/zsh"
+# args = ["-l"]
+
+# ── UI Theme ──────────────────────────────────────
+# [ui]
+# sidebar_width = 200.0
+# bottom_bar_height = 24.0
+# pane_spacing = 2.0
+#
+# [ui.font]
+# small = 12.0
+# tiny = 10.0
+# tab = 13.0
+# group = 11.0
+# terminal = 14.0
+#
+# [ui.colors]
+# bg_primary = "#1c1c24"
+# bg_secondary = "#262631"
+# bg_sidebar = "#1f1f26"
+# bg_tab_active = "#2e2e38"
+# bg_tab_hover = "#292933"
+# accent = "#6699f2"
+# text_secondary = "#8c8c99"
+# text_tab_active = "#f2f2f2"
+# status_running = "#4dcc66"
+# status_pending = "#e6b333"
+# status_idle = "#737380"
+# focus_border = "#598ce6"
 "##;
 
     let _ = std::fs::write(&path, default_toml);
@@ -323,5 +535,127 @@ repo = "~/test"
         let path = config_path();
         assert!(path.to_str().unwrap().contains("golem-terminal"));
         assert!(path.to_str().unwrap().ends_with("golems.toml"));
+    }
+
+    #[test]
+    fn ui_config_defaults() {
+        let ui = UiConfig::default();
+        assert_eq!(ui.sidebar_width, 200.0);
+        assert_eq!(ui.bottom_bar_height, 24.0);
+        assert_eq!(ui.pane_spacing, 2.0);
+        assert_eq!(ui.font.small, 12.0);
+        assert_eq!(ui.font.tiny, 10.0);
+        assert_eq!(ui.font.tab, 13.0);
+        assert_eq!(ui.font.group, 11.0);
+        assert_eq!(ui.font.terminal, 14.0);
+        assert_eq!(ui.colors.bg_primary, "#1c1c24");
+        assert_eq!(ui.colors.accent, "#6699f2");
+    }
+
+    #[test]
+    fn shell_config_defaults() {
+        let shell = ShellConfig::default();
+        assert_eq!(shell.program, "/bin/zsh");
+        assert_eq!(shell.args, vec!["-l"]);
+    }
+
+    #[test]
+    fn app_config_default_includes_ui_and_shell() {
+        let config = AppConfig::default();
+        assert_eq!(config.ui, UiConfig::default());
+        assert_eq!(config.shell, ShellConfig::default());
+    }
+
+    #[test]
+    fn toml_roundtrip_ui_config() {
+        let toml_str = r##"
+[ui]
+sidebar_width = 250.0
+
+[ui.font]
+small = 14.0
+
+[ui.colors]
+accent = "#ff0000"
+
+[shell]
+program = "/bin/bash"
+args = ["--norc"]
+"##;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.ui.sidebar_width, 250.0);
+        assert_eq!(config.ui.bottom_bar_height, 24.0); // default preserved
+        assert_eq!(config.ui.font.small, 14.0);
+        assert_eq!(config.ui.font.tab, 13.0); // default preserved
+        assert_eq!(config.ui.colors.accent, "#ff0000");
+        assert_eq!(config.ui.colors.bg_primary, "#1c1c24"); // default preserved
+        assert_eq!(config.shell.program, "/bin/bash");
+        assert_eq!(config.shell.args, vec!["--norc"]);
+    }
+
+    #[test]
+    fn toml_roundtrip_serialization() {
+        let config = AppConfig::default();
+        let serialized = toml::to_string(&config).unwrap();
+        let deserialized: AppConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(config, deserialized);
+    }
+}
+
+#[cfg(all(test, feature = "gui"))]
+mod gui_tests {
+    use super::*;
+
+    #[test]
+    fn parse_hex_color_basic() {
+        let c = parse_hex_color("#ff0000");
+        assert!((c.r - 1.0).abs() < 0.01);
+        assert!(c.g.abs() < 0.01);
+        assert!(c.b.abs() < 0.01);
+        assert!((c.a - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn parse_hex_color_without_hash() {
+        let c = parse_hex_color("00ff00");
+        assert!(c.r.abs() < 0.01);
+        assert!((c.g - 1.0).abs() < 0.01);
+        assert!(c.b.abs() < 0.01);
+    }
+
+    #[test]
+    fn parse_hex_color_invalid_returns_magenta() {
+        let c = parse_hex_color("xyz");
+        // Magenta fallback = (1.0, 0.0, 1.0)
+        assert!((c.r - 1.0).abs() < 0.01);
+        assert!(c.g.abs() < 0.01);
+        assert!((c.b - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn parse_hex_color_with_alpha() {
+        let c = super::parse_hex_color_alpha("#1f1f26", 0.7);
+        assert!((c.a - 0.7).abs() < 0.01);
+    }
+
+    #[test]
+    fn default_colors_parse_without_error() {
+        let colors = ColorConfig::default();
+        // All default hex strings should parse without hitting magenta fallback
+        let all_hex = [
+            &colors.bg_primary, &colors.bg_secondary, &colors.bg_sidebar,
+            &colors.bg_tab_active, &colors.bg_tab_hover, &colors.accent,
+            &colors.text_secondary, &colors.text_tab_active,
+            &colors.status_running, &colors.status_pending, &colors.status_idle,
+            &colors.focus_border,
+        ];
+        for hex in &all_hex {
+            let c = parse_hex_color(hex);
+            // Magenta fallback means broken — should NOT be magenta
+            assert!(
+                !((c.r - 1.0).abs() < 0.01 && c.g.abs() < 0.01 && (c.b - 1.0).abs() < 0.01),
+                "Color {hex} parsed as magenta (broken)"
+            );
+        }
     }
 }
