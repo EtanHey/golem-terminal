@@ -32,6 +32,7 @@ Tab-based terminal multiplexer for Claude Code orchestration. Built with Rust + 
 - **orchestrate.py** — Python script for UDS control (REPL, demo, CLI)
 - **debug.sh** — Lightweight debug REPL for connected terminal
 - **launch.sh** — Build + launch with debug socket enabled
+- **install.sh** — Build + install .app to ~/Applications for dock launcher
 
 ### UDS Commands
 
