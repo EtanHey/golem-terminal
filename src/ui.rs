@@ -1,9 +1,10 @@
 // Golem Terminal V2 — Tab-based terminal multiplexer built on Iced + iced_term
 //
-// AIDEV-NOTE: V2 uses iced_term (alacritty_terminal backend) for proper terminal
-// rendering with colors, cursor, selection, scrollback. Sidebar navigation
-// (Zen browser style) replaces top tab bar.
+// V2 uses iced_term (alacritty_terminal backend) for proper terminal rendering
+// with colors, cursor, selection, scrollback. Sidebar navigation (Zen browser
+// style) replaces top tab bar. pane_grid provides recursive splits.
 
+use iced::widget::pane_grid::{self, PaneGrid};
 use iced::widget::{button, column, container, mouse_area, row, rule, text, Space};
 use iced::{keyboard, Length, Subscription, Task};
 use std::sync::{Arc, Mutex};
@@ -29,11 +30,19 @@ const BOTTOM_BAR_HEIGHT: f32 = 24.0;
 const BORDER_RADIUS: f32 = 4.0;
 const RULE_THICKNESS: f32 = 1.0;
 const STATUS_DOT_SIZE: f32 = 8.0;
+const PANE_SPACING: f32 = 2.0;
+const PANE_RESIZE_GRAB_AREA: f32 = 6.0;
 
 // Colors (iTerm-inspired dark theme)
 const BG_PRIMARY: iced::Color = iced::Color::from_rgb(0.11, 0.11, 0.14);
 const BG_SECONDARY: iced::Color = iced::Color::from_rgb(0.15, 0.15, 0.19);
-const BG_SIDEBAR: iced::Color = iced::Color::from_rgb(0.12, 0.12, 0.15);
+// Sidebar has alpha < 1.0 so macOS vibrancy shows through
+const BG_SIDEBAR: iced::Color = iced::Color {
+    r: 0.12,
+    g: 0.12,
+    b: 0.15,
+    a: 0.7,
+};
 const BG_TAB_ACTIVE: iced::Color = iced::Color::from_rgb(0.18, 0.18, 0.22);
 const BG_TAB_HOVER: iced::Color = iced::Color::from_rgb(0.16, 0.16, 0.20);
 const TEXT_SECONDARY: iced::Color = iced::Color::from_rgb(0.55, 0.55, 0.60);
@@ -57,15 +66,19 @@ pub enum SlotStatus {
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    // Tab management
+    // Tab management (sidebar)
     SelectTab(usize),
     NewTab,
     CloseTab(usize),
     SwitchTab(i32),
 
-    // Split screen
-    ToggleSplit,
-    FocusPane(PaneSide),
+    // Pane grid
+    PaneClicked(pane_grid::Pane),
+    PaneDragged(pane_grid::DragEvent),
+    PaneResized(pane_grid::ResizeEvent),
+    SplitFocused(pane_grid::Axis),
+    ClosePane,
+    ToggleSplit, // backward compat: toggle between 1-pane and 2-pane
 
     // Terminal lifecycle
     LaunchSlot(usize),
@@ -81,12 +94,6 @@ pub enum Message {
 
     // Sidebar
     ToggleSidebar,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum PaneSide {
-    Primary,
-    Secondary,
 }
 
 // ── Agent Slot ───────────────────────────────────────────────────────────────
@@ -134,9 +141,8 @@ impl AgentSlot {
         self.status = SlotStatus::Pending;
         match iced_term::Terminal::new(self.id as u64, self.term_settings.clone()) {
             Ok(mut term) => {
-                // AIDEV-NOTE: Register bindings that swallow our Cmd shortcuts so
-                // iced_term doesn't forward the letter to the PTY. BindingAction::LinkOpen
-                // falls to the no-op `_ => {}` branch in iced_term's keyboard handler.
+                // Register bindings that swallow our Cmd shortcuts so iced_term
+                // doesn't forward the letter to the PTY.
                 term.handle(iced_term::Command::AddBindings(gui_shortcut_bindings()));
                 self.terminal = Some(term);
                 self.status = SlotStatus::Running;
@@ -198,15 +204,15 @@ fn iterm_color_palette() -> iced_term::ColorPalette {
 }
 
 // ── GUI Shortcut Bindings ─────────────────────────────────────────────────
-// AIDEV-NOTE: These bindings prevent Cmd+letter shortcuts from being forwarded
-// to the PTY by iced_term. Without them, pressing Cmd+D would both toggle split
-// AND type 'd' into the terminal. BindingAction::LinkOpen is a no-op in
-// iced_term's keyboard handler (falls to `_ => {}`).
+// These bindings prevent Cmd+letter shortcuts from being forwarded to the PTY
+// by iced_term. BindingAction::LinkOpen is a no-op in iced_term's keyboard
+// handler (falls to `_ => {}`).
 
 fn gui_shortcut_bindings() -> Vec<(Binding<InputKind>, BindingAction)> {
     use iced::keyboard::Modifiers;
 
     let cmd = Modifiers::COMMAND;
+    let cmd_shift = Modifiers::COMMAND | Modifiers::SHIFT;
 
     let swallow = |key: &str, mods: Modifiers| -> (Binding<InputKind>, BindingAction) {
         (
@@ -221,10 +227,12 @@ fn gui_shortcut_bindings() -> Vec<(Binding<InputKind>, BindingAction)> {
     };
 
     vec![
-        swallow("d", cmd),   // Cmd+D → toggle split
-        swallow("b", cmd),   // Cmd+B → toggle sidebar
-        swallow("t", cmd),   // Cmd+T → new tab
-        swallow("q", cmd),   // Cmd+Q → quit
+        swallow("d", cmd),       // Cmd+D → split horizontal
+        swallow("d", cmd_shift), // Cmd+Shift+D → split vertical
+        swallow("b", cmd),       // Cmd+B → toggle sidebar
+        swallow("t", cmd),       // Cmd+T → new tab
+        swallow("w", cmd),       // Cmd+W → close pane
+        swallow("q", cmd),       // Cmd+Q → quit
         // Cmd+1-9 → select tab
         swallow("1", cmd),
         swallow("2", cmd),
@@ -242,19 +250,21 @@ fn gui_shortcut_bindings() -> Vec<(Binding<InputKind>, BindingAction)> {
 
 pub struct State {
     pub slots: Vec<AgentSlot>,
-    pub active_tab: usize,
-    pub split_active: bool,
-    pub split_secondary: usize,
-    pub focused_pane: PaneSide,
+    pub panes: pane_grid::State<usize>, // each pane stores a slot index
+    pub focus: Option<pane_grid::Pane>,
     pub sidebar_visible: bool,
     pub base_cmd: Vec<String>,
     pub next_slot_id: usize,
     pub test_state: Arc<Mutex<crate::test_harness::TestState>>,
+    #[cfg(target_os = "macos")]
+    vibrancy_applied: bool,
 }
 
 impl State {
     pub fn new(cmd: Vec<String>) -> Self {
         let slot = AgentSlot::new(0, cmd.clone(), "Agent 1".into());
+        let (panes, first_pane) = pane_grid::State::new(0_usize); // pane 0 → slot 0
+
         let test_state = Arc::new(Mutex::new(crate::test_harness::TestState {
             slots: vec![crate::test_harness::SlotState::default()],
             active_tab: 0,
@@ -265,30 +275,46 @@ impl State {
 
         Self {
             slots: vec![slot],
-            active_tab: 0,
-            split_active: false,
-            split_secondary: 0,
-            focused_pane: PaneSide::Primary,
+            panes,
+            focus: Some(first_pane),
             sidebar_visible: true,
             base_cmd: cmd,
             next_slot_id: 1,
             test_state,
+            #[cfg(target_os = "macos")]
+            vibrancy_applied: false,
         }
     }
 
-    fn active_slot(&self) -> Option<usize> {
-        if self.slots.is_empty() {
-            None
-        } else {
-            Some(self.active_tab.min(self.slots.len() - 1))
-        }
+    /// The slot index of the focused pane, if any.
+    pub fn active_slot_idx(&self) -> Option<usize> {
+        self.focus.and_then(|p| self.panes.get(p).copied())
+    }
+
+    /// Check if a slot index is currently visible in any pane.
+    fn slot_in_pane(&self, slot_idx: usize) -> Option<pane_grid::Pane> {
+        self.panes.iter().find_map(|(pane, &idx)| {
+            if idx == slot_idx { Some(*pane) } else { None }
+        })
     }
 
     fn sync_test_state(&self) {
         let mut ts = self.test_state.lock().unwrap();
-        ts.active_tab = self.active_tab;
-        ts.split_active = self.split_active;
-        ts.split_secondary = self.split_secondary;
+        ts.active_tab = self.active_slot_idx().unwrap_or(0);
+        ts.split_active = self.panes.len() > 1;
+
+        // For backward compat, find the "secondary" pane's slot
+        if self.panes.len() > 1 {
+            if let Some(focus) = self.focus {
+                // secondary = first pane that isn't the focused one
+                ts.split_secondary = self.panes.iter()
+                    .find(|(p, _)| **p != focus)
+                    .map(|(_, &idx)| idx)
+                    .unwrap_or(0);
+            }
+        } else {
+            ts.split_secondary = 0;
+        }
 
         // Sync slot statuses
         while ts.slots.len() < self.slots.len() {
@@ -308,11 +334,20 @@ impl State {
     // ── Update ───────────────────────────────────────────────────────────────
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        // Apply vibrancy on first update (window now exists, we're on main thread)
+        #[cfg(target_os = "macos")]
+        if !self.vibrancy_applied {
+            self.vibrancy_applied = true;
+            // Only apply in GUI mode (MainThreadMarker::new() returns None in tests)
+            if objc2::MainThreadMarker::new().is_some() {
+                apply_macos_vibrancy();
+            }
+        }
+
         let task = match message {
             Message::LaunchSlot(idx) => {
                 if idx < self.slots.len() && self.slots[idx].status == SlotStatus::Idle {
                     self.slots[idx].launch();
-                    // Focus the newly launched terminal
                     if let Some(ref term) = self.slots[idx].terminal {
                         return TerminalView::focus(term.widget_id().clone());
                     }
@@ -341,23 +376,18 @@ impl State {
 
             Message::SelectTab(idx) => {
                 if idx < self.slots.len() {
-                    if self.split_active {
-                        if idx == self.split_secondary {
-                            // Clicked the secondary tab → swap primary and secondary
-                            self.split_secondary = self.active_tab;
-                            self.active_tab = idx;
-                        } else if idx == self.active_tab {
-                            // Clicked the already-active primary → no change
-                        } else {
-                            // Clicked a third tab → it becomes primary, secondary stays
-                            self.active_tab = idx;
+                    // If this slot is already in a pane, focus that pane
+                    if let Some(pane) = self.slot_in_pane(idx) {
+                        self.focus = Some(pane);
+                    } else if let Some(focused) = self.focus {
+                        // Otherwise, update the focused pane to show this slot
+                        if let Some(slot_ref) = self.panes.get_mut(focused) {
+                            *slot_ref = idx;
                         }
-                    } else {
-                        self.active_tab = idx;
                     }
-                    self.focused_pane = PaneSide::Primary;
-                    // Focus the primary terminal widget
-                    if let Some(ref term) = self.slots[self.active_tab].terminal {
+                    // Focus the terminal widget
+                    if let Some(ref term) = self.slots[idx].terminal {
+                        self.sync_test_state();
                         return TerminalView::focus(term.widget_id().clone());
                     }
                 }
@@ -370,7 +400,14 @@ impl State {
                 let label = format!("Agent {}", id + 1);
                 let slot = AgentSlot::new(id, self.base_cmd.clone(), label);
                 self.slots.push(slot);
-                self.active_tab = self.slots.len() - 1;
+
+                // Update focused pane to show the new slot
+                let new_idx = self.slots.len() - 1;
+                if let Some(focused) = self.focus {
+                    if let Some(slot_ref) = self.panes.get_mut(focused) {
+                        *slot_ref = new_idx;
+                    }
+                }
 
                 let mut ts = self.test_state.lock().unwrap();
                 ts.slots.push(crate::test_harness::SlotState::default());
@@ -385,81 +422,190 @@ impl State {
                 }
                 self.slots[idx].kill();
                 self.slots.remove(idx);
-                if self.active_tab >= self.slots.len() {
-                    self.active_tab = self.slots.len() - 1;
+
+                // Update all pane references: any pane pointing to idx or above
+                // needs adjustment
+                let pane_updates: Vec<(pane_grid::Pane, usize)> = self.panes.iter()
+                    .map(|(pane, &slot_idx)| {
+                        let new_idx = if slot_idx == idx {
+                            // This pane pointed to the removed slot — clamp
+                            idx.min(self.slots.len() - 1)
+                        } else if slot_idx > idx {
+                            slot_idx - 1
+                        } else {
+                            slot_idx
+                        };
+                        (*pane, new_idx)
+                    })
+                    .collect();
+
+                for (pane, new_idx) in pane_updates {
+                    if let Some(slot_ref) = self.panes.get_mut(pane) {
+                        *slot_ref = new_idx;
+                    }
                 }
-                if self.split_secondary >= self.slots.len() {
-                    self.split_secondary = self.slots.len().saturating_sub(1);
-                }
+
                 Task::none()
             }
 
             Message::SwitchTab(delta) => {
-                // In split mode, Cmd+Alt+Arrow switches focus between panes
-                if self.split_active {
-                    let new_side = match self.focused_pane {
-                        PaneSide::Primary => PaneSide::Secondary,
-                        PaneSide::Secondary => PaneSide::Primary,
-                    };
-                    self.focused_pane = new_side;
-                    let idx = match new_side {
-                        PaneSide::Primary => self.active_tab,
-                        PaneSide::Secondary => self.split_secondary,
-                    };
-                    if idx < self.slots.len() {
-                        if let Some(ref term) = self.slots[idx].terminal {
-                            return TerminalView::focus(term.widget_id().clone());
+                // If multiple panes, cycle focus between panes
+                if self.panes.len() > 1 {
+                    if let Some(focused) = self.focus {
+                        // Try primary direction, then fallback to opposite for wrap
+                        let (primary, fallback) = if delta > 0 {
+                            (pane_grid::Direction::Right, pane_grid::Direction::Left)
+                        } else {
+                            (pane_grid::Direction::Left, pane_grid::Direction::Right)
+                        };
+                        let adjacent = self.panes.adjacent(focused, primary)
+                            .or_else(|| self.panes.adjacent(focused, fallback));
+                        if let Some(adj) = adjacent {
+                            self.focus = Some(adj);
+                            if let Some(&slot_idx) = self.panes.get(adj) {
+                                if slot_idx < self.slots.len() {
+                                    if let Some(ref term) = self.slots[slot_idx].terminal {
+                                        self.sync_test_state();
+                                        return TerminalView::focus(term.widget_id().clone());
+                                    }
+                                }
+                            }
                         }
                     }
                     return Task::none();
                 }
-                // Not in split mode — cycle tabs normally
+                // Single pane — cycle the slot shown in it
                 let len = self.slots.len() as i32;
                 if len == 0 {
                     return Task::none();
                 }
-                let current = self.active_tab as i32;
+                let current = self.active_slot_idx().unwrap_or(0) as i32;
                 let new_idx = (current + delta).rem_euclid(len) as usize;
-                self.active_tab = new_idx;
-                self.focused_pane = PaneSide::Primary;
+                if let Some(focused) = self.focus {
+                    if let Some(slot_ref) = self.panes.get_mut(focused) {
+                        *slot_ref = new_idx;
+                    }
+                }
                 if let Some(ref term) = self.slots[new_idx].terminal {
+                    self.sync_test_state();
                     return TerminalView::focus(term.widget_id().clone());
                 }
                 Task::none()
             }
 
-            Message::ToggleSplit => {
-                self.split_active = !self.split_active;
-                if self.split_active && self.slots.len() > 1 {
-                    self.split_secondary = if self.active_tab == 0 { 1 } else { 0 };
-                    // Focus the NEW secondary pane (the one just added to split)
-                    self.focused_pane = PaneSide::Secondary;
-                    if let Some(ref term) = self.slots[self.split_secondary].terminal {
-                        return TerminalView::focus(term.widget_id().clone());
-                    }
-                } else {
-                    // Split closed — focus primary
-                    self.focused_pane = PaneSide::Primary;
-                    if let Some(ref term) = self.slots[self.active_tab].terminal {
-                        return TerminalView::focus(term.widget_id().clone());
+            Message::SplitFocused(axis) => {
+                if let Some(focused) = self.focus {
+                    // Create a new slot for the new pane
+                    let id = self.next_slot_id;
+                    self.next_slot_id += 1;
+                    let label = format!("Agent {}", id + 1);
+                    let slot = AgentSlot::new(id, self.base_cmd.clone(), label);
+                    self.slots.push(slot);
+                    let new_idx = self.slots.len() - 1;
+
+                    let mut ts = self.test_state.lock().unwrap();
+                    ts.slots.push(crate::test_harness::SlotState::default());
+                    drop(ts);
+
+                    if let Some((new_pane, _)) = self.panes.split(axis, focused, new_idx) {
+                        self.focus = Some(new_pane);
                     }
                 }
                 Task::none()
             }
 
-            Message::FocusPane(side) => {
-                self.focused_pane = side;
-                let idx = match side {
-                    PaneSide::Primary => self.active_tab,
-                    PaneSide::Secondary => self.split_secondary,
-                };
-                if idx < self.slots.len() {
-                    if let Some(ref term) = self.slots[idx].terminal {
-                        return TerminalView::focus(term.widget_id().clone());
+            Message::ToggleSplit => {
+                if self.panes.len() > 1 {
+                    // Close all panes except focused
+                    while self.panes.len() > 1 {
+                        // Find a pane that isn't focused
+                        let to_close = self.panes.iter()
+                            .find(|(p, _)| Some(**p) != self.focus)
+                            .map(|(p, _)| *p);
+                        if let Some(pane) = to_close {
+                            if let Some((_, sibling)) = self.panes.close(pane) {
+                                self.focus = Some(sibling);
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    // Focus the remaining pane's terminal
+                    if let Some(&slot_idx) = self.focus.and_then(|f| self.panes.get(f)) {
+                        if slot_idx < self.slots.len() {
+                            if let Some(ref term) = self.slots[slot_idx].terminal {
+                                self.sync_test_state();
+                                return TerminalView::focus(term.widget_id().clone());
+                            }
+                        }
+                    }
+                } else if self.slots.len() > 1 {
+                    // Only 1 pane, multiple slots → split and show a second slot
+                    if let Some(focused) = self.focus {
+                        let current = self.active_slot_idx().unwrap_or(0);
+                        // Pick the first slot not currently shown
+                        let secondary = (0..self.slots.len())
+                            .find(|&i| i != current)
+                            .unwrap_or(0);
+                        if let Some((new_pane, _)) = self.panes.split(
+                            pane_grid::Axis::Vertical,
+                            focused,
+                            secondary,
+                        ) {
+                            self.focus = Some(new_pane);
+                            if let Some(ref term) = self.slots[secondary].terminal {
+                                self.sync_test_state();
+                                return TerminalView::focus(term.widget_id().clone());
+                            }
+                        }
                     }
                 }
                 Task::none()
             }
+
+            Message::ClosePane => {
+                if let Some(focused) = self.focus {
+                    if self.panes.len() > 1 {
+                        if let Some((_, sibling)) = self.panes.close(focused) {
+                            self.focus = Some(sibling);
+                            if let Some(&slot_idx) = self.panes.get(sibling) {
+                                if slot_idx < self.slots.len() {
+                                    if let Some(ref term) = self.slots[slot_idx].terminal {
+                                        self.sync_test_state();
+                                        return TerminalView::focus(term.widget_id().clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Task::none()
+            }
+
+            Message::PaneClicked(pane) => {
+                self.focus = Some(pane);
+                if let Some(&slot_idx) = self.panes.get(pane) {
+                    if slot_idx < self.slots.len() {
+                        if let Some(ref term) = self.slots[slot_idx].terminal {
+                            self.sync_test_state();
+                            return TerminalView::focus(term.widget_id().clone());
+                        }
+                    }
+                }
+                Task::none()
+            }
+
+            Message::PaneResized(pane_grid::ResizeEvent { split, ratio }) => {
+                self.panes.resize(split, ratio);
+                Task::none()
+            }
+
+            Message::PaneDragged(pane_grid::DragEvent::Dropped { pane, target }) => {
+                self.panes.drop(pane, target);
+                Task::none()
+            }
+
+            Message::PaneDragged(_) => Task::none(),
 
             Message::TermEvent(iced_term::Event::BackendCall(id, cmd)) => {
                 if let Some(slot) = self.slots.iter_mut().find(|s| s.id as u64 == id) {
@@ -476,14 +622,13 @@ impl State {
 
             Message::ToggleSidebar => {
                 self.sidebar_visible = !self.sidebar_visible;
-                // Re-focus current terminal to prevent dual-focus
-                let focus_idx = match self.focused_pane {
-                    PaneSide::Primary => self.active_tab,
-                    PaneSide::Secondary => self.split_secondary,
-                };
-                if focus_idx < self.slots.len() {
-                    if let Some(ref term) = self.slots[focus_idx].terminal {
-                        return TerminalView::focus(term.widget_id().clone());
+                // Re-focus current terminal
+                if let Some(slot_idx) = self.active_slot_idx() {
+                    if slot_idx < self.slots.len() {
+                        if let Some(ref term) = self.slots[slot_idx].terminal {
+                            self.sync_test_state();
+                            return TerminalView::focus(term.widget_id().clone());
+                        }
                     }
                 }
                 Task::none()
@@ -517,7 +662,7 @@ impl State {
 
         // GUI shortcuts (Cmd-based, not forwarded to terminal)
         subscriptions.push(keyboard::listen().map(|event| match event {
-            // Cmd+Alt+Left/Right → SwitchTab (update handler checks split state)
+            // Cmd+Alt+Left/Right → SwitchTab (cycles panes or tabs)
             keyboard::Event::KeyPressed {
                 key, modifiers, ..
             } if modifiers.command() && modifiers.alt() => match key {
@@ -527,7 +672,6 @@ impl State {
                 keyboard::Key::Named(keyboard::key::Named::ArrowRight) => {
                     Message::SwitchTab(1)
                 }
-                // Cmd+Alt+Up/Down → also cycle tabs
                 keyboard::Key::Named(keyboard::key::Named::ArrowUp) => {
                     Message::SwitchTab(-1)
                 }
@@ -536,18 +680,34 @@ impl State {
                 }
                 _ => Message::KeyboardIgnored,
             },
+            // Cmd+Shift+D → split vertical
+            keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character(ref c),
+                modifiers,
+                ..
+            } if c.as_ref() == "d" && modifiers.command() && modifiers.shift() => {
+                Message::SplitFocused(pane_grid::Axis::Vertical)
+            }
             // Cmd+T → new tab
             keyboard::Event::KeyPressed {
                 key: keyboard::Key::Character(ref c),
                 modifiers,
                 ..
             } if c.as_ref() == "t" && modifiers.command() => Message::NewTab,
-            // Cmd+D → toggle split
+            // Cmd+D → split horizontal
             keyboard::Event::KeyPressed {
                 key: keyboard::Key::Character(ref c),
                 modifiers,
                 ..
-            } if c.as_ref() == "d" && modifiers.command() => Message::ToggleSplit,
+            } if c.as_ref() == "d" && modifiers.command() => {
+                Message::SplitFocused(pane_grid::Axis::Horizontal)
+            }
+            // Cmd+W → close pane
+            keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character(ref c),
+                modifiers,
+                ..
+            } if c.as_ref() == "w" && modifiers.command() => Message::ClosePane,
             // Cmd+B → toggle sidebar
             keyboard::Event::KeyPressed {
                 key: keyboard::Key::Character(ref c),
@@ -585,27 +745,40 @@ impl State {
     // ── View ─────────────────────────────────────────────────────────────────
 
     pub fn view(&self) -> iced::Element<'_, Message> {
-        let content_area = if self.split_active && self.slots.len() > 1 {
-            let left_idx = self.active_tab;
-            let right_idx = self.split_secondary;
+        let focus = self.focus;
 
-            let left_panel = self.view_terminal_panel(left_idx, PaneSide::Primary);
-            let right_panel = self.view_terminal_panel(right_idx, PaneSide::Secondary);
+        let pane_grid_widget = PaneGrid::new(&self.panes, |pane_id, &slot_idx, _is_maximized| {
+            let is_focused = focus == Some(pane_id);
+            let content = self.view_pane_content(slot_idx, is_focused);
 
-            row![left_panel, rule::vertical(RULE_THICKNESS), right_panel]
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into()
-        } else if let Some(idx) = self.active_slot() {
-            self.view_terminal_panel(idx, PaneSide::Primary)
-        } else {
-            container(text("No tabs open").color(TEXT_SECONDARY))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .align_x(iced::Alignment::Center)
-                .align_y(iced::Alignment::Center)
-                .into()
-        };
+            pane_grid::Content::new(content)
+                .style(move |_theme| {
+                    let border_color = if is_focused {
+                        FOCUS_BORDER_COLOR
+                    } else {
+                        iced::Color::TRANSPARENT
+                    };
+                    container::Style {
+                        border: iced::Border {
+                            color: border_color,
+                            width: if is_focused { 2.0 } else { 0.0 },
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }
+                })
+        })
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .spacing(PANE_SPACING)
+        .on_click(Message::PaneClicked)
+        .on_drag(Message::PaneDragged)
+        .on_resize(PANE_RESIZE_GRAB_AREA, Message::PaneResized);
+
+        let content_area: iced::Element<'_, Message> = container(pane_grid_widget)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
 
         if self.sidebar_visible {
             let sidebar = self.view_sidebar();
@@ -616,6 +789,68 @@ impl State {
         } else {
             content_area
         }
+    }
+
+    // ── Pane Content ─────────────────────────────────────────────────────────
+
+    fn view_pane_content(
+        &self,
+        slot_idx: usize,
+        _is_focused: bool,
+    ) -> iced::Element<'_, Message> {
+        if slot_idx >= self.slots.len() {
+            return container(text("Invalid pane").color(TEXT_SECONDARY))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(iced::Alignment::Center)
+                .align_y(iced::Alignment::Center)
+                .into();
+        }
+
+        let slot = &self.slots[slot_idx];
+
+        let terminal_view: iced::Element<'_, Message> = if let Some(ref term) = slot.terminal {
+            container(
+                TerminalView::show(term).map(Message::TermEvent),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+        } else {
+            // Idle state — show launch prompt
+            let launch_text = column![
+                text("Terminal idle").size(FONT_SMALL).color(TEXT_SECONDARY),
+                text("Press Enter or click to launch")
+                    .size(FONT_TINY)
+                    .color(TEXT_SECONDARY),
+            ]
+            .spacing(SPACING_TIGHT)
+            .align_x(iced::Alignment::Center);
+
+            let launch_area = button(
+                container(launch_text)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .align_x(iced::Alignment::Center)
+                    .align_y(iced::Alignment::Center),
+            )
+            .style(|_theme, _status| iced::widget::button::Style {
+                background: Some(iced::Background::Color(BG_PRIMARY)),
+                ..Default::default()
+            })
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .on_press(Message::LaunchSlot(slot_idx));
+
+            launch_area.into()
+        };
+
+        let bottom_bar = self.view_bottom_bar(slot);
+
+        column![terminal_view, rule::horizontal(RULE_THICKNESS), bottom_bar]
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     // ── Sidebar ──────────────────────────────────────────────────────────────
@@ -632,10 +867,14 @@ impl State {
         .padding([SPACING_TIGHT, SPACING_NORMAL]);
         sidebar_content = sidebar_content.push(group_header);
 
+        let active_slot = self.active_slot_idx();
+        // Collect all slot indices currently visible in panes
+        let visible_slots: Vec<usize> = self.panes.iter().map(|(_, idx)| *idx).collect();
+
         // Tab entries
         for (i, slot) in self.slots.iter().enumerate() {
-            let is_active = i == self.active_tab;
-            let is_split_secondary = self.split_active && i == self.split_secondary;
+            let is_active = active_slot == Some(i);
+            let is_in_split = !is_active && visible_slots.contains(&i);
 
             // Status dot
             let dot_color = match slot.status {
@@ -646,7 +885,7 @@ impl State {
             let dot = text("●").size(STATUS_DOT_SIZE).color(dot_color);
 
             // Label
-            let label_color = if is_active || is_split_secondary {
+            let label_color = if is_active || is_in_split {
                 TEXT_TAB_ACTIVE
             } else {
                 TEXT_SECONDARY
@@ -660,7 +899,7 @@ impl State {
             // Background
             let bg = if is_active {
                 BG_TAB_ACTIVE
-            } else if is_split_secondary {
+            } else if is_in_split {
                 BG_TAB_HOVER
             } else {
                 iced::Color::TRANSPARENT
@@ -669,7 +908,7 @@ impl State {
             // Left accent border for active tab
             let border_color = if is_active {
                 ACCENT_COLOR
-            } else if is_split_secondary {
+            } else if is_in_split {
                 FOCUS_BORDER_COLOR
             } else {
                 iced::Color::TRANSPARENT
@@ -680,7 +919,7 @@ impl State {
                     background: Some(iced::Background::Color(bg)),
                     border: iced::Border {
                         color: border_color,
-                        width: if is_active || is_split_secondary {
+                        width: if is_active || is_in_split {
                             2.0
                         } else {
                             0.0
@@ -746,95 +985,6 @@ impl State {
             .into()
     }
 
-    // ── Terminal Panel ───────────────────────────────────────────────────────
-
-    fn view_terminal_panel(
-        &self,
-        idx: usize,
-        pane_side: PaneSide,
-    ) -> iced::Element<'_, Message> {
-        let slot = &self.slots[idx];
-        let is_focused = self.focused_pane == pane_side;
-        let width = if self.split_active {
-            Length::FillPortion(1)
-        } else {
-            Length::Fill
-        };
-
-        let terminal_view: iced::Element<'_, Message> = if let Some(ref term) = slot.terminal {
-            container(
-                TerminalView::show(term).map(Message::TermEvent),
-            )
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
-        } else {
-            // Idle state — show launch prompt
-            let launch_text = column![
-                text("Terminal idle").size(FONT_SMALL).color(TEXT_SECONDARY),
-                text("Press Enter or click to launch")
-                    .size(FONT_TINY)
-                    .color(TEXT_SECONDARY),
-            ]
-            .spacing(SPACING_TIGHT)
-            .align_x(iced::Alignment::Center);
-
-            let launch_area = button(
-                container(launch_text)
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .align_x(iced::Alignment::Center)
-                    .align_y(iced::Alignment::Center),
-            )
-            .style(|_theme, _status| iced::widget::button::Style {
-                background: Some(iced::Background::Color(BG_PRIMARY)),
-                ..Default::default()
-            })
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .on_press(Message::LaunchSlot(idx));
-
-            launch_area.into()
-        };
-
-        let bottom_bar = self.view_bottom_bar(slot);
-
-        // Focus border indicator
-        let border_color = if is_focused && self.split_active {
-            FOCUS_BORDER_COLOR
-        } else {
-            iced::Color::TRANSPARENT
-        };
-
-        let panel = column![terminal_view, rule::horizontal(RULE_THICKNESS), bottom_bar]
-            .width(width)
-            .height(Length::Fill);
-
-        let styled_panel = container(panel)
-            .style(move |_theme| container::Style {
-                border: iced::Border {
-                    color: border_color,
-                    width: if is_focused && self.split_active {
-                        2.0
-                    } else {
-                        0.0
-                    },
-                    ..Default::default()
-                },
-                ..Default::default()
-            })
-            .width(width)
-            .height(Length::Fill);
-
-        if self.split_active {
-            mouse_area(styled_panel)
-                .on_press(Message::FocusPane(pane_side))
-                .into()
-        } else {
-            styled_panel.into()
-        }
-    }
-
     // ── Bottom Bar ───────────────────────────────────────────────────────────
 
     fn view_bottom_bar<'a>(&self, slot: &'a AgentSlot) -> iced::Element<'a, Message> {
@@ -867,6 +1017,58 @@ impl State {
     }
 }
 
+// ── macOS Vibrancy ───────────────────────────────────────────────────────────
+
+#[cfg(target_os = "macos")]
+fn apply_macos_vibrancy() {
+    use objc2::rc::Retained;
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSApplication;
+    use std::ptr::NonNull;
+
+    // This must be called from the main thread (Iced's update runs on main)
+    let mtm = MainThreadMarker::new()
+        .expect("apply_macos_vibrancy must be called from main thread");
+
+    let app = NSApplication::sharedApplication(mtm);
+    let Some(window) = (unsafe { app.keyWindow() }) else {
+        eprintln!("[vibrancy] no key window found");
+        return;
+    };
+
+    let Some(content_view) = (unsafe { window.contentView() }) else {
+        eprintln!("[vibrancy] no content view");
+        return;
+    };
+
+    // Wrap the NSView pointer for window-vibrancy
+    let ns_view_ptr = Retained::as_ptr(&content_view) as *mut std::ffi::c_void;
+
+    struct NsViewHandle(NonNull<std::ffi::c_void>);
+
+    impl iced::window::raw_window_handle::HasWindowHandle for NsViewHandle {
+        fn window_handle(
+            &self,
+        ) -> Result<iced::window::raw_window_handle::WindowHandle<'_>, iced::window::raw_window_handle::HandleError> {
+            let handle = iced::window::raw_window_handle::AppKitWindowHandle::new(self.0);
+            Ok(unsafe { iced::window::raw_window_handle::WindowHandle::borrow_raw(handle.into()) })
+        }
+    }
+
+    if let Some(ptr) = NonNull::new(ns_view_ptr) {
+        let handle = NsViewHandle(ptr);
+        match window_vibrancy::apply_vibrancy(
+            &handle,
+            window_vibrancy::NSVisualEffectMaterial::Sidebar,
+            Some(window_vibrancy::NSVisualEffectState::Active),
+            None,
+        ) {
+            Ok(()) => eprintln!("[vibrancy] applied Sidebar material"),
+            Err(e) => eprintln!("[vibrancy] failed: {e}"),
+        }
+    }
+}
+
 // ── Run ──────────────────────────────────────────────────────────────────────
 
 pub fn run(cmd: Vec<String>) -> anyhow::Result<()> {
@@ -879,6 +1081,7 @@ pub fn run(cmd: Vec<String>) -> anyhow::Result<()> {
         win.platform_specific.title_hidden = true;
         win.platform_specific.titlebar_transparent = true;
         win.platform_specific.fullsize_content_view = true;
+        win.transparent = true; // Required for vibrancy to show through
     }
 
     iced::application(
@@ -911,11 +1114,19 @@ fn load_window_icon() -> Option<iced::window::Icon> {
 mod tests {
     use super::*;
 
+    fn active_slot(state: &State) -> usize {
+        state.active_slot_idx().unwrap_or(0)
+    }
+
+    fn pane_count(state: &State) -> usize {
+        state.panes.len()
+    }
+
     #[test]
     fn new_state_has_one_tab() {
         let state = State::new(vec!["echo".into(), "hi".into()]);
         assert_eq!(state.slots.len(), 1);
-        assert_eq!(state.active_tab, 0);
+        assert_eq!(active_slot(&state), 0);
     }
 
     #[test]
@@ -923,7 +1134,8 @@ mod tests {
         let mut state = State::new(vec!["echo".into()]);
         let _ = state.update(Message::NewTab);
         assert_eq!(state.slots.len(), 2);
-        assert_eq!(state.active_tab, 1);
+        // NewTab updates focused pane to show the new slot
+        assert_eq!(active_slot(&state), 1);
     }
 
     #[test]
@@ -938,37 +1150,35 @@ mod tests {
         let mut state = State::new(vec!["echo".into()]);
         let _ = state.update(Message::NewTab);
         let _ = state.update(Message::NewTab);
-        assert_eq!(state.active_tab, 2);
+        assert_eq!(active_slot(&state), 2);
         let _ = state.update(Message::SwitchTab(1));
-        assert_eq!(state.active_tab, 0);
+        assert_eq!(active_slot(&state), 0);
     }
 
     #[test]
-    fn switch_tab_in_split_toggles_focus() {
+    fn switch_tab_in_split_cycles_panes() {
         let mut state = State::new(vec!["echo".into()]);
         let _ = state.update(Message::NewTab);
         let _ = state.update(Message::SelectTab(0));
         let _ = state.update(Message::ToggleSplit);
-        assert!(state.split_active);
-        // ToggleSplit focuses secondary
-        assert_eq!(state.focused_pane, PaneSide::Secondary);
-        // SwitchTab in split mode should toggle focus, not change tabs
+        assert!(pane_count(&state) > 1);
+        let before = active_slot(&state);
+        // SwitchTab in split mode should cycle focus between panes
         let _ = state.update(Message::SwitchTab(1));
-        assert_eq!(state.focused_pane, PaneSide::Primary);
-        assert_eq!(state.active_tab, 0, "tabs should not change in split SwitchTab");
-        let _ = state.update(Message::SwitchTab(-1));
-        assert_eq!(state.focused_pane, PaneSide::Secondary);
+        // Focus should have changed to a different pane (different slot)
+        let after = active_slot(&state);
+        assert_ne!(before, after, "focus should move to different pane");
     }
 
     #[test]
     fn toggle_split() {
         let mut state = State::new(vec!["echo".into()]);
         let _ = state.update(Message::NewTab);
-        assert!(!state.split_active);
+        assert_eq!(pane_count(&state), 1);
         let _ = state.update(Message::ToggleSplit);
-        assert!(state.split_active);
+        assert!(pane_count(&state) > 1, "toggle should create split");
         let _ = state.update(Message::ToggleSplit);
-        assert!(!state.split_active);
+        assert_eq!(pane_count(&state), 1, "toggle again should collapse");
     }
 
     #[test]
@@ -986,29 +1196,21 @@ mod tests {
         let mut state = State::new(vec!["echo".into()]);
         let _ = state.update(Message::NewTab);
         let _ = state.update(Message::SelectTab(0));
-        assert_eq!(state.active_tab, 0);
+        assert_eq!(active_slot(&state), 0);
         let _ = state.update(Message::SwitchTab(-1));
-        assert_eq!(state.active_tab, 1, "SwitchTab(-1) from 0 should wrap to last");
+        assert_eq!(active_slot(&state), 1, "SwitchTab(-1) from 0 should wrap to last");
     }
 
     #[test]
     fn close_tab_clamps_active_tab() {
         let mut state = State::new(vec!["echo".into()]);
         let _ = state.update(Message::NewTab);
-        assert_eq!(state.active_tab, 1);
-        let _ = state.update(Message::CloseTab(1));
-        assert_eq!(state.active_tab, 0, "active_tab must clamp after closing last tab");
-    }
-
-    #[test]
-    fn close_tab_clamps_split_secondary() {
-        let mut state = State::new(vec!["echo".into()]);
-        let _ = state.update(Message::NewTab);
-        state.split_secondary = 1;
+        let _ = state.update(Message::SelectTab(1));
+        assert_eq!(active_slot(&state), 1);
         let _ = state.update(Message::CloseTab(1));
         assert!(
-            state.split_secondary < state.slots.len(),
-            "split_secondary must clamp after tab removal"
+            active_slot(&state) < state.slots.len(),
+            "active_tab must clamp after closing last tab"
         );
     }
 
@@ -1017,22 +1219,48 @@ mod tests {
         let mut state = State::new(vec!["echo".into()]);
         let _ = state.update(Message::NewTab);
         let _ = state.update(Message::NewTab);
-        assert_eq!(state.active_tab, 2);
+        assert_eq!(active_slot(&state), 2);
         let _ = state.update(Message::SelectTab(0));
-        assert_eq!(state.active_tab, 0);
+        assert_eq!(active_slot(&state), 0);
     }
 
     #[test]
-    fn focus_pane_switches() {
+    fn split_focused_creates_new_pane() {
         let mut state = State::new(vec!["echo".into()]);
-        let _ = state.update(Message::NewTab);
-        let _ = state.update(Message::ToggleSplit);
-        // ToggleSplit focuses the new secondary pane
-        assert_eq!(state.focused_pane, PaneSide::Secondary);
-        let _ = state.update(Message::FocusPane(PaneSide::Primary));
-        assert_eq!(state.focused_pane, PaneSide::Primary);
-        let _ = state.update(Message::FocusPane(PaneSide::Secondary));
-        assert_eq!(state.focused_pane, PaneSide::Secondary);
+        assert_eq!(pane_count(&state), 1);
+        let _ = state.update(Message::SplitFocused(pane_grid::Axis::Horizontal));
+        assert_eq!(pane_count(&state), 2);
+        assert_eq!(state.slots.len(), 2, "split should create new slot");
+    }
+
+    #[test]
+    fn close_pane_merges() {
+        let mut state = State::new(vec!["echo".into()]);
+        let _ = state.update(Message::SplitFocused(pane_grid::Axis::Horizontal));
+        assert_eq!(pane_count(&state), 2);
+        let _ = state.update(Message::ClosePane);
+        assert_eq!(pane_count(&state), 1);
+    }
+
+    #[test]
+    fn close_pane_noop_when_single() {
+        let mut state = State::new(vec!["echo".into()]);
+        assert_eq!(pane_count(&state), 1);
+        let _ = state.update(Message::ClosePane);
+        assert_eq!(pane_count(&state), 1, "should not close the last pane");
+    }
+
+    #[test]
+    fn pane_clicked_sets_focus() {
+        let mut state = State::new(vec!["echo".into()]);
+        let _ = state.update(Message::SplitFocused(pane_grid::Axis::Horizontal));
+        // Get the non-focused pane
+        let other = state.panes.iter()
+            .find(|(p, _)| Some(**p) != state.focus)
+            .map(|(p, _)| *p)
+            .unwrap();
+        let _ = state.update(Message::PaneClicked(other));
+        assert_eq!(state.focus, Some(other));
     }
 
     #[test]
@@ -1051,35 +1279,5 @@ mod tests {
         let _ = state.update(Message::NewTab);
         // New tabs should be idle, not auto-launched
         assert_eq!(state.slots[1].status, SlotStatus::Idle);
-    }
-
-    #[test]
-    fn split_select_secondary_swaps() {
-        let mut state = State::new(vec!["echo".into()]);
-        let _ = state.update(Message::NewTab);
-        let _ = state.update(Message::NewTab);
-        // Tab 0 is primary, enable split
-        let _ = state.update(Message::SelectTab(0));
-        let _ = state.update(Message::ToggleSplit);
-        assert_eq!(state.active_tab, 0);
-        assert_eq!(state.split_secondary, 1);
-        // Click the secondary tab (1) → should swap
-        let _ = state.update(Message::SelectTab(1));
-        assert_eq!(state.active_tab, 1, "secondary should become primary");
-        assert_eq!(state.split_secondary, 0, "old primary should become secondary");
-    }
-
-    #[test]
-    fn split_select_third_tab_keeps_secondary() {
-        let mut state = State::new(vec!["echo".into()]);
-        let _ = state.update(Message::NewTab);
-        let _ = state.update(Message::NewTab);
-        let _ = state.update(Message::SelectTab(0));
-        let _ = state.update(Message::ToggleSplit);
-        assert_eq!(state.split_secondary, 1);
-        // Click tab 2 (not in split) → becomes primary, secondary stays
-        let _ = state.update(Message::SelectTab(2));
-        assert_eq!(state.active_tab, 2);
-        assert_eq!(state.split_secondary, 1, "secondary should not change");
     }
 }
