@@ -62,6 +62,11 @@ pub enum Message {
     // iced_term events (forwarded per terminal instance)
     TermEvent(iced_term::Event),
 
+    // Keyboard shortcuts
+    ClosePaneOrTab,
+    ClearTerminal,
+    DeleteWordLeft,
+
     // Window
     Quit,
     KeyboardIgnored,
@@ -757,6 +762,66 @@ impl State {
                 Task::none()
             }
 
+            Message::ClosePaneOrTab => {
+                if self.panes.len() > 1 {
+                    // Split mode: close the focused pane
+                    if let Some(focused) = self.focus {
+                        if let Some((_, sibling)) = self.panes.close(focused) {
+                            self.focus = Some(sibling);
+                            if let Some(&slot_idx) = self.panes.get(sibling) {
+                                if slot_idx < self.slots.len() {
+                                    if let Some(ref term) = self.slots[slot_idx].terminal {
+                                        self.sync_test_state();
+                                        return TerminalView::focus(term.widget_id().clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Single pane: close the active tab
+                    if let Some(idx) = self.active_slot_idx() {
+                        if self.slots.len() > 1 {
+                            return self.update(Message::CloseTab(idx));
+                        }
+                        // Last tab: quit
+                        return self.update(Message::Quit);
+                    }
+                }
+                Task::none()
+            }
+
+            Message::ClearTerminal => {
+                // Send clear screen escape sequence to focused terminal
+                if let Some(slot_idx) = self.active_slot_idx() {
+                    if let Some(slot) = self.slots.get_mut(slot_idx) {
+                        if let Some(ref mut terminal) = slot.terminal {
+                            // Send "clear" command: Ctrl+L (form feed)
+                            let cmd = iced_term::Command::ProxyToBackend(
+                                iced_term::backend::Command::Write(vec![0x0c]),
+                            );
+                            terminal.handle(cmd);
+                        }
+                    }
+                }
+                Task::none()
+            }
+
+            Message::DeleteWordLeft => {
+                // Send Ctrl+W (delete word backward) to focused terminal
+                if let Some(slot_idx) = self.active_slot_idx() {
+                    if let Some(slot) = self.slots.get_mut(slot_idx) {
+                        if let Some(ref mut terminal) = slot.terminal {
+                            let cmd = iced_term::Command::ProxyToBackend(
+                                iced_term::backend::Command::Write(vec![0x17]), // Ctrl+W
+                            );
+                            terminal.handle(cmd);
+                        }
+                    }
+                }
+                Task::none()
+            }
+
             Message::PaneClicked(pane) => {
                 self.focus = Some(pane);
                 if let Some(&slot_idx) = self.panes.get(pane) {
@@ -928,12 +993,24 @@ impl State {
                 modifiers,
                 ..
             } if c.as_ref() == "d" && modifiers.command() => Message::ToggleSplit,
-            // Cmd+W → close pane
+            // Cmd+W → close pane (split) or close tab (single pane)
             keyboard::Event::KeyPressed {
                 key: keyboard::Key::Character(ref c),
                 modifiers,
                 ..
-            } if c.as_ref() == "w" && modifiers.command() => Message::ClosePane,
+            } if c.as_ref() == "w" && modifiers.command() => Message::ClosePaneOrTab,
+            // Cmd+K → clear terminal
+            keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character(ref c),
+                modifiers,
+                ..
+            } if c.as_ref() == "k" && modifiers.command() => Message::ClearTerminal,
+            // Cmd+Backspace → delete word left (send Ctrl+W to PTY)
+            keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Backspace),
+                modifiers,
+                ..
+            } if modifiers.command() => Message::DeleteWordLeft,
             // Cmd+B → toggle sidebar
             keyboard::Event::KeyPressed {
                 key: keyboard::Key::Character(ref c),
@@ -1872,5 +1949,27 @@ mod tests {
         let workers = state.golems_in_group("workers");
         assert_eq!(workers.len(), 1);
         assert_eq!(workers[0].name, "brainClaude");
+    }
+
+    #[test]
+    fn close_pane_or_tab_in_single_pane_closes_tab() {
+        let mut state = State::new(vec!["echo".into()]);
+        // Add a second tab
+        let _ = state.update(Message::NewTab);
+        assert_eq!(state.slots.len(), 2);
+        // Select tab 1
+        let _ = state.update(Message::SelectTab(1));
+        // ClosePaneOrTab in single-pane mode should close the tab
+        let _ = state.update(Message::ClosePaneOrTab);
+        assert_eq!(state.slots.len(), 1, "tab should be removed in single-pane mode");
+    }
+
+    #[test]
+    fn close_pane_or_tab_in_split_closes_pane() {
+        let mut state = State::new(vec!["echo".into()]);
+        let _ = state.update(Message::SplitFocused(pane_grid::Axis::Horizontal));
+        assert_eq!(state.panes.len(), 2, "should have 2 panes after split");
+        let _ = state.update(Message::ClosePaneOrTab);
+        assert_eq!(state.panes.len(), 1, "should close pane, not tab");
     }
 }
