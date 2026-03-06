@@ -1,3 +1,4 @@
+mod agent_state;
 mod config;
 mod pty;
 mod session;

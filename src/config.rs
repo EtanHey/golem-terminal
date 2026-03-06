@@ -114,6 +114,8 @@ pub struct ColorConfig {
     pub status_pending: String,
     #[serde(default = "default_status_idle")]
     pub status_idle: String,
+    #[serde(default = "default_status_error")]
+    pub status_error: String,
     #[serde(default = "default_focus_border")]
     pub focus_border: String,
 }
@@ -204,6 +206,9 @@ fn default_status_pending() -> String {
 fn default_status_idle() -> String {
     "#737380".into()
 }
+fn default_status_error() -> String {
+    "#e65353".into()
+}
 fn default_focus_border() -> String {
     "#598ce6".into()
 }
@@ -265,6 +270,7 @@ impl Default for ColorConfig {
             status_running: default_status_running(),
             status_pending: default_status_pending(),
             status_idle: default_status_idle(),
+            status_error: default_status_error(),
             focus_border: default_focus_border(),
         }
     }
