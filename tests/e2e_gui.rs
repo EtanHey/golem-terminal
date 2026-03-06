@@ -45,11 +45,7 @@ fn query(writer: &mut impl Write, reader: &mut BufReader<UnixStream>, cmd: &str)
     line
 }
 
-fn get_status(
-    writer: &mut UnixStream,
-    reader: &mut BufReader<UnixStream>,
-    slot: usize,
-) -> String {
+fn get_status(writer: &mut UnixStream, reader: &mut BufReader<UnixStream>, slot: usize) -> String {
     let cmd = format!(r#"{{"cmd":"status","slot":{slot}}}"#);
     let resp = query(writer, reader, &cmd);
     resp.trim()
@@ -74,11 +70,7 @@ fn wait_for_status(
     panic!("slot {slot} status never reached '{target}'");
 }
 
-fn get_content(
-    writer: &mut UnixStream,
-    reader: &mut BufReader<UnixStream>,
-    slot: usize,
-) -> String {
+fn get_content(writer: &mut UnixStream, reader: &mut BufReader<UnixStream>, slot: usize) -> String {
     let cmd = format!(r#"{{"cmd":"content","slot":{slot}}}"#);
     let resp = query(writer, reader, &cmd);
     let hex = resp
@@ -106,10 +98,7 @@ fn wait_for_content_contains(
     panic!("slot {slot} content never contained '{target}', got: {content:?}");
 }
 
-fn get_slot_count(
-    writer: &mut UnixStream,
-    reader: &mut BufReader<UnixStream>,
-) -> usize {
+fn get_slot_count(writer: &mut UnixStream, reader: &mut BufReader<UnixStream>) -> usize {
     let resp = query(writer, reader, r#"{"cmd":"slot_count"}"#);
     let trimmed = resp.trim();
     trimmed

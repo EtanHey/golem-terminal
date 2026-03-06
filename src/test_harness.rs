@@ -102,8 +102,12 @@ pub fn start(shared: Arc<Mutex<TestState>>) -> Task<Message> {
                         // Commands that don't require a valid slot index.
                         let slot_free_cmd = matches!(
                             parsed.cmd.as_str(),
-                            "quit" | "slot_count" | "new_tab" | "toggle_split"
-                                | "active_tab" | "split_status"
+                            "quit"
+                                | "slot_count"
+                                | "new_tab"
+                                | "toggle_split"
+                                | "active_tab"
+                                | "split_status"
                         );
                         if !slot_free_cmd {
                             let slot_count = shared.lock().unwrap().slots.len();
@@ -122,9 +126,7 @@ pub fn start(shared: Arc<Mutex<TestState>>) -> Task<Message> {
 
                         match parsed.cmd.as_str() {
                             "quit" => {
-                                let _ = futures::executor::block_on(
-                                    sender.send(Message::Quit),
-                                );
+                                let _ = futures::executor::block_on(sender.send(Message::Quit));
                                 return;
                             }
                             "launch" => {
@@ -140,42 +142,32 @@ pub fn start(shared: Arc<Mutex<TestState>>) -> Task<Message> {
                             "send_input" => {
                                 if let Some(data) = parsed.data {
                                     let _ = futures::executor::block_on(
-                                        sender
-                                            .send(Message::SendInput(parsed.slot, data)),
+                                        sender.send(Message::SendInput(parsed.slot, data)),
                                     );
                                 }
                             }
                             "status" => {
                                 let state = shared.lock().unwrap();
                                 let status_str = &state.slots[parsed.slot].status;
-                                reply(
-                                    &mut writer,
-                                    &format!("{{\"status\":\"{status_str}\"}}\n"),
-                                );
+                                reply(&mut writer, &format!("{{\"status\":\"{status_str}\"}}\n"));
                             }
                             "content" => {
                                 let hex = {
                                     let state = shared.lock().unwrap();
-                                    hex_encode(
-                                        state.slots[parsed.slot].content.as_bytes(),
-                                    )
+                                    hex_encode(state.slots[parsed.slot].content.as_bytes())
                                 };
-                                reply(
-                                    &mut writer,
-                                    &format!("{{\"content\":\"{hex}\"}}\n"),
-                                );
+                                reply(&mut writer, &format!("{{\"content\":\"{hex}\"}}\n"));
                             }
                             "output" => {
                                 let state = shared.lock().unwrap();
                                 let hex = hex_encode(&state.slots[parsed.slot].raw_output);
-                                reply(
-                                    &mut writer,
-                                    &format!("{{\"output\":\"{hex}\"}}\n"),
-                                );
+                                reply(&mut writer, &format!("{{\"output\":\"{hex}\"}}\n"));
                             }
                             "new_tab" => {
+                                let new_slot = shared.lock().unwrap().slots.len();
+                                let _ = futures::executor::block_on(sender.send(Message::NewTab));
                                 let _ = futures::executor::block_on(
-                                    sender.send(Message::NewTab),
+                                    sender.send(Message::LaunchSlot(new_slot)),
                                 );
                             }
                             "close_tab" => {
@@ -189,24 +181,17 @@ pub fn start(shared: Arc<Mutex<TestState>>) -> Task<Message> {
                                 );
                             }
                             "toggle_split" => {
-                                let _ = futures::executor::block_on(
-                                    sender.send(Message::ToggleSplit),
-                                );
+                                let _ =
+                                    futures::executor::block_on(sender.send(Message::ToggleSplit));
                             }
                             "slot_count" => {
                                 let count = shared.lock().unwrap().slots.len();
-                                reply(
-                                    &mut writer,
-                                    &format!("{{\"slot_count\":{count}}}\n"),
-                                );
+                                reply(&mut writer, &format!("{{\"slot_count\":{count}}}\n"));
                             }
                             "active_tab" => {
                                 let state = shared.lock().unwrap();
                                 let tab = state.active_tab;
-                                reply(
-                                    &mut writer,
-                                    &format!("{{\"active_tab\":{tab}}}\n"),
-                                );
+                                reply(&mut writer, &format!("{{\"active_tab\":{tab}}}\n"));
                             }
                             "split_status" => {
                                 let state = shared.lock().unwrap();
@@ -220,9 +205,7 @@ pub fn start(shared: Arc<Mutex<TestState>>) -> Task<Message> {
                             other => {
                                 reply(
                                     &mut writer,
-                                    &error_reply(&format!(
-                                        "unknown command: {other}"
-                                    )),
+                                    &error_reply(&format!("unknown command: {other}")),
                                 );
                             }
                         }
@@ -238,7 +221,10 @@ pub fn start(shared: Arc<Mutex<TestState>>) -> Task<Message> {
 }
 
 fn reply(writer: &mut impl Write, resp: &str) {
-    if let Err(e) = writer.write_all(resp.as_bytes()).and_then(|_| writer.flush()) {
+    if let Err(e) = writer
+        .write_all(resp.as_bytes())
+        .and_then(|_| writer.flush())
+    {
         eprintln!("[test-harness] reply failed: {e}");
     }
 }
