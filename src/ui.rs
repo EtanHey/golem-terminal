@@ -542,8 +542,7 @@ impl State {
                         let id = self.next_slot_id;
                         self.next_slot_id += 1;
                         let label = format!("Agent {}", id + 1);
-                        let slot = AgentSlot::new(id, self.base_cmd.clone(), label, &self.config);
-                        self.slots.push(slot);
+                        let slot = AgentSlot::new(id, self.base_cmd.clone(), label, &self.config);                        self.slots.push(slot);
                         let mut ts = self.test_state.lock().unwrap();
                         ts.slots.push(crate::test_harness::SlotState::default());
                         drop(ts);
@@ -845,8 +844,7 @@ impl State {
             .width(Length::Fill)
             .height(Length::Fill)
             .style(move |_theme| container::Style {
-                background: Some(iced::Background::Color(bg_primary)),
-                ..Default::default()
+                background: Some(iced::Background::Color(bg_primary)),                ..Default::default()
             })
             .into()
         } else {
