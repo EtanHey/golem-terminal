@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use iced_term::bindings::{Binding, BindingAction, InputKind};
 use iced_term::TerminalView;
 
+use crate::agent_state;
 use crate::config::{parse_hex_color, parse_hex_color_alpha};
 
 // ── Constants (non-themed, not in config) ───────────────────────────────────
@@ -69,6 +70,9 @@ pub enum Message {
     ToggleSidebar,
     ToggleGroup(String),
     LaunchGolem(String),
+
+    // Agent state polling
+    AgentStateTick,
 
     // Config hot-reload
     ConfigReloaded(crate::config::AppConfig),
@@ -251,6 +255,8 @@ pub struct State {
     pub test_state: Arc<Mutex<crate::test_harness::TestState>>,
     pub config: crate::config::AppConfig,
     pub collapsed_groups: std::collections::HashMap<String, bool>,
+    pub agent_states: std::collections::HashMap<String, agent_state::AgentExternalState>,
+    agent_state_dir: std::path::PathBuf,
     #[cfg(target_os = "macos")]
     vibrancy_applied: bool,
 }
@@ -282,6 +288,8 @@ impl State {
             test_state,
             config,
             collapsed_groups: std::collections::HashMap::new(),
+            agent_states: std::collections::HashMap::new(),
+            agent_state_dir: agent_state::state_dir(),
             #[cfg(target_os = "macos")]
             vibrancy_applied: false,
         };
@@ -386,6 +394,21 @@ impl State {
             .iter()
             .filter_map(|name| self.config.golem.iter().find(|g| &g.name == name))
             .collect()
+    }
+
+    /// Find the best matching external agent state for a slot label.
+    /// Matches by checking if any state file's surface name contains the label (case-insensitive).
+    fn agent_state_for_slot(&self, label: &str) -> Option<&agent_state::AgentExternalState> {
+        let label_lower = label.to_lowercase().replace(' ', "-");
+        // Try exact match first
+        if let Some(state) = self.agent_states.get(&label_lower) {
+            return Some(state);
+        }
+        // Try partial match (surface name contains label)
+        self.agent_states
+            .iter()
+            .find(|(surface, _)| surface.contains(&label_lower) || label_lower.contains(surface.as_str()))
+            .map(|(_, state)| state)
     }
 
     fn terminal_content_text(terminal: &iced_term::Terminal) -> String {
@@ -830,6 +853,11 @@ impl State {
                 Task::none()
             }
 
+            Message::AgentStateTick => {
+                self.agent_states = agent_state::read_all_states(&self.agent_state_dir);
+                Task::none()
+            }
+
             Message::ConfigReloaded(new_config) => {
                 eprintln!(
                     "[config] reloaded: {} golems, {} groups",
@@ -936,6 +964,11 @@ impl State {
             }
             _ => Message::KeyboardIgnored,
         }));
+
+        // Agent state polling (every 2 seconds)
+        subscriptions.push(
+            iced::time::every(std::time::Duration::from_secs(2)).map(|_| Message::AgentStateTick),
+        );
 
         // Config file watcher for hot-reload
         subscriptions.push(crate::config::watch_config().map(Message::ConfigReloaded));
@@ -1068,6 +1101,7 @@ impl State {
         let status_running = parse_hex_color(&colors.status_running);
         let status_pending = parse_hex_color(&colors.status_pending);
         let status_idle = parse_hex_color(&colors.status_idle);
+        let status_error = parse_hex_color(&colors.status_error);
         let bg_tab_active = parse_hex_color(&colors.bg_tab_active);
         let bg_tab_hover = parse_hex_color(&colors.bg_tab_hover);
         let accent_color = parse_hex_color(&colors.accent);
@@ -1077,6 +1111,7 @@ impl State {
         let font_group = font.group;
         let font_tab = font.tab;
         let font_small = font.small;
+        let font_tiny = font.tiny;
 
         let mut sidebar_content = column![].spacing(2.0).padding([SPACING_NORMAL, 0.0]);
 
@@ -1175,19 +1210,49 @@ impl State {
                             )
                         };
 
+                    // Override dot color from external agent state if available
+                    let ext_state = self.agent_state_for_slot(&golem.name);
+                    let dot_color = if let Some(ext) = ext_state {
+                        match ext.status_color_hint() {
+                            "running" => status_running,
+                            "pending" => status_pending,
+                            "error" => status_error,
+                            _ => dot_color,
+                        }
+                    } else {
+                        dot_color
+                    };
+
                     let icon_text = text(&golem.icon).size(font_tab);
-                    let label = text(&golem.name).size(font_tab).color(label_color);
+                    let label_widget = text(&golem.name).size(font_tab).color(label_color);
                     let dot = text("●").size(STATUS_DOT_SIZE).color(dot_color);
 
-                    let tab_row = row![icon_text, label, Space::new().width(Length::Fill), dot]
-                        .spacing(SPACING_TIGHT)
-                        .align_y(iced::Alignment::Center);
+                    let top_row =
+                        row![icon_text, label_widget, Space::new().width(Length::Fill), dot]
+                            .spacing(SPACING_TIGHT)
+                            .align_y(iced::Alignment::Center);
+
+                    // Build tab content: top row + optional subtitle from agent state
+                    let tab_content: iced::Element<'_, Message> =
+                        if let Some(ext) = ext_state {
+                            let summary = ext.sidebar_summary();
+                            if summary.is_empty() {
+                                top_row.into()
+                            } else {
+                                let subtitle = text(summary)
+                                    .size(font_tiny)
+                                    .color(text_secondary);
+                                column![top_row, subtitle].spacing(1).into()
+                            }
+                        } else {
+                            top_row.into()
+                        };
 
                     let is_bordered = slot_idx.map_or(false, |idx| {
                         active_slot == Some(idx) || visible_slots.contains(&idx)
                     });
 
-                    let tab_container = container(tab_row)
+                    let tab_container = container(tab_content)
                         .style(move |_theme| container::Style {
                             background: Some(iced::Background::Color(bg)),
                             border: iced::Border {
