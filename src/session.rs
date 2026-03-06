@@ -44,7 +44,11 @@ impl SessionHandle {
     pub fn kill(&mut self) -> Result<()> {
         if let Some(pid) = self.child.process_id() {
             let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-            anyhow::ensure!(ret == 0, "kill(SIGTERM) failed: {}", std::io::Error::last_os_error());
+            anyhow::ensure!(
+                ret == 0,
+                "kill(SIGTERM) failed: {}",
+                std::io::Error::last_os_error()
+            );
         }
         Ok(())
     }
@@ -86,7 +90,12 @@ fn spawn_inner(cmd: Vec<String>, cols: u16, rows: u16) -> Result<SessionHandle> 
 
     let pty_system = native_pty_system();
     let pair = pty_system
-        .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+        .openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
         .context("openpty failed")?;
 
     let mut cmd_builder = CommandBuilder::new(&cmd[0]);
@@ -205,8 +214,12 @@ mod tests {
     fn first_output_chunk_is_ready_signal() {
         // Use a long-lived process so the PTY stays open while we read.
         // Plain `echo` exits so fast the reader thread may miss the data.
-        let mut handle =
-            spawn(vec!["sh".into(), "-c".into(), "echo ready; exec cat".into()]).unwrap();
+        let mut handle = spawn(vec![
+            "sh".into(),
+            "-c".into(),
+            "echo ready; exec cat".into(),
+        ])
+        .unwrap();
         let first = handle.output.recv().expect("first chunk should arrive");
         assert!(!first.is_empty(), "first output chunk must be non-empty");
         assert!(
@@ -220,8 +233,12 @@ mod tests {
     #[test]
     fn take_output_yields_child_output() {
         // Keep child alive with `exec cat` so the PTY channel stays open.
-        let mut handle =
-            spawn(vec!["sh".into(), "-c".into(), "echo transferred; exec cat".into()]).unwrap();
+        let mut handle = spawn(vec![
+            "sh".into(),
+            "-c".into(),
+            "echo transferred; exec cat".into(),
+        ])
+        .unwrap();
 
         let rx = handle.take_output();
         let mut output = Vec::new();
@@ -279,9 +296,7 @@ mod gui_tests {
         }
 
         // Now send input — cat should echo it back.
-        handle
-            .send(b"test123\r")
-            .expect("send() should succeed");
+        handle.send(b"test123\r").expect("send() should succeed");
 
         // Collect output until we see "test123" echoed back.
         let mut echo_output = Vec::new();
@@ -296,9 +311,7 @@ mod gui_tests {
                 }
                 Err(_) => {
                     let text = String::from_utf8_lossy(&echo_output);
-                    panic!(
-                        "timed out waiting for echo of 'test123'; got so far: {text:?}"
-                    );
+                    panic!("timed out waiting for echo of 'test123'; got so far: {text:?}");
                 }
             }
         }
@@ -355,9 +368,7 @@ mod gui_tests {
                 }
                 Err(_) => {
                     let text = String::from_utf8_lossy(&echo_output);
-                    panic!(
-                        "timed out waiting for echo of 'ping'; got so far: {text:?}"
-                    );
+                    panic!("timed out waiting for echo of 'ping'; got so far: {text:?}");
                 }
             }
         }

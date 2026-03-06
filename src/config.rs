@@ -143,34 +143,78 @@ fn default_golem_type() -> GolemType {
 }
 
 // UI layout defaults
-fn default_sidebar_width() -> f32 { 200.0 }
-fn default_bottom_bar_height() -> f32 { 24.0 }
-fn default_pane_spacing() -> f32 { 2.0 }
+fn default_sidebar_width() -> f32 {
+    200.0
+}
+fn default_bottom_bar_height() -> f32 {
+    24.0
+}
+fn default_pane_spacing() -> f32 {
+    2.0
+}
 
 // Font defaults
-fn default_font_small() -> f32 { 12.0 }
-fn default_font_tiny() -> f32 { 10.0 }
-fn default_font_tab() -> f32 { 13.0 }
-fn default_font_group() -> f32 { 11.0 }
-fn default_font_terminal() -> f32 { 14.0 }
+fn default_font_small() -> f32 {
+    12.0
+}
+fn default_font_tiny() -> f32 {
+    10.0
+}
+fn default_font_tab() -> f32 {
+    13.0
+}
+fn default_font_group() -> f32 {
+    11.0
+}
+fn default_font_terminal() -> f32 {
+    14.0
+}
 
 // Color defaults (hex strings matching current hardcoded iced::Color values)
-fn default_bg_primary() -> String { "#1c1c24".into() }
-fn default_bg_secondary() -> String { "#262631".into() }
-fn default_bg_sidebar() -> String { "#1f1f26".into() }
-fn default_bg_tab_active() -> String { "#2e2e38".into() }
-fn default_bg_tab_hover() -> String { "#292933".into() }
-fn default_accent() -> String { "#6699f2".into() }
-fn default_text_secondary() -> String { "#8c8c99".into() }
-fn default_text_tab_active() -> String { "#f2f2f2".into() }
-fn default_status_running() -> String { "#4dcc66".into() }
-fn default_status_pending() -> String { "#e6b333".into() }
-fn default_status_idle() -> String { "#737380".into() }
-fn default_focus_border() -> String { "#598ce6".into() }
+fn default_bg_primary() -> String {
+    "#1c1c24".into()
+}
+fn default_bg_secondary() -> String {
+    "#262631".into()
+}
+fn default_bg_sidebar() -> String {
+    "#1f1f26".into()
+}
+fn default_bg_tab_active() -> String {
+    "#2e2e38".into()
+}
+fn default_bg_tab_hover() -> String {
+    "#292933".into()
+}
+fn default_accent() -> String {
+    "#6699f2".into()
+}
+fn default_text_secondary() -> String {
+    "#8c8c99".into()
+}
+fn default_text_tab_active() -> String {
+    "#f2f2f2".into()
+}
+fn default_status_running() -> String {
+    "#4dcc66".into()
+}
+fn default_status_pending() -> String {
+    "#e6b333".into()
+}
+fn default_status_idle() -> String {
+    "#737380".into()
+}
+fn default_focus_border() -> String {
+    "#598ce6".into()
+}
 
 // Shell defaults
-fn default_shell_program() -> String { "/bin/zsh".into() }
-fn default_shell_args() -> Vec<String> { vec!["-l".into()] }
+fn default_shell_program() -> String {
+    "/bin/zsh".into()
+}
+fn default_shell_args() -> Vec<String> {
+    vec!["-l".into()]
+}
 
 impl Default for AppConfig {
     fn default() -> Self {
@@ -379,72 +423,74 @@ pub fn watch_config() -> iced::Subscription<AppConfig> {
     use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
     iced::Subscription::run(|| {
-        stream::channel(8, move |mut sender: futures::channel::mpsc::Sender<AppConfig>| async move {
-            use futures::sink::SinkExt;
+        stream::channel(
+            8,
+            move |mut sender: futures::channel::mpsc::Sender<AppConfig>| async move {
+                use futures::sink::SinkExt;
 
-            let path = config_path();
-            let watch_dir = config_dir();
+                let path = config_path();
+                let watch_dir = config_dir();
 
-            // Create directory if needed
-            let _ = std::fs::create_dir_all(&watch_dir);
+                // Create directory if needed
+                let _ = std::fs::create_dir_all(&watch_dir);
 
-            let (tx, rx) = std::sync::mpsc::channel();
+                let (tx, rx) = std::sync::mpsc::channel();
 
-            let mut watcher: RecommendedWatcher =
-                match notify::Watcher::new(tx, notify::Config::default()) {
-                    Ok(w) => w,
-                    Err(e) => {
-                        eprintln!("[config] failed to create watcher: {e}");
-                        // Block forever — no watcher, no updates
-                        futures::future::pending::<()>().await;
-                        return;
-                    }
-                };
+                let mut watcher: RecommendedWatcher =
+                    match notify::Watcher::new(tx, notify::Config::default()) {
+                        Ok(w) => w,
+                        Err(e) => {
+                            eprintln!("[config] failed to create watcher: {e}");
+                            // Block forever — no watcher, no updates
+                            futures::future::pending::<()>().await;
+                            return;
+                        }
+                    };
 
-            if let Err(e) = watcher.watch(&watch_dir, RecursiveMode::NonRecursive) {
-                eprintln!("[config] failed to watch {}: {e}", watch_dir.display());
-                futures::future::pending::<()>().await;
-                return;
-            }
+                if let Err(e) = watcher.watch(&watch_dir, RecursiveMode::NonRecursive) {
+                    eprintln!("[config] failed to watch {}: {e}", watch_dir.display());
+                    futures::future::pending::<()>().await;
+                    return;
+                }
 
-            eprintln!("[config] watching {}", path.display());
+                eprintln!("[config] watching {}", path.display());
 
-            // Move to blocking thread for the mpsc recv loop
-            let (done_tx, done_rx) = futures::channel::oneshot::channel::<()>();
-            std::thread::spawn(move || {
-                while let Ok(result) = rx.recv() {
-                    match result {
-                        Ok(Event {
-                            kind: EventKind::Modify(_) | EventKind::Create(_),
-                            paths,
-                            ..
-                        }) => {
-                            // Only reload if our config file was modified
-                            if paths.iter().any(|p| p.ends_with("golems.toml")) {
-                                match load() {
-                                    Ok(config) => {
-                                        eprintln!("[config] reloaded golems.toml");
-                                        let _ = futures::executor::block_on(
-                                            sender.send(config),
-                                        );
-                                    }
-                                    Err(e) => {
-                                        eprintln!("[config] reload error: {e}");
+                // Move to blocking thread for the mpsc recv loop
+                let (done_tx, done_rx) = futures::channel::oneshot::channel::<()>();
+                std::thread::spawn(move || {
+                    while let Ok(result) = rx.recv() {
+                        match result {
+                            Ok(Event {
+                                kind: EventKind::Modify(_) | EventKind::Create(_),
+                                paths,
+                                ..
+                            }) => {
+                                // Only reload if our config file was modified
+                                if paths.iter().any(|p| p.ends_with("golems.toml")) {
+                                    match load() {
+                                        Ok(config) => {
+                                            eprintln!("[config] reloaded golems.toml");
+                                            let _ =
+                                                futures::executor::block_on(sender.send(config));
+                                        }
+                                        Err(e) => {
+                                            eprintln!("[config] reload error: {e}");
+                                        }
                                     }
                                 }
                             }
+                            Err(e) => {
+                                eprintln!("[config] watch error: {e}");
+                            }
+                            _ => {}
                         }
-                        Err(e) => {
-                            eprintln!("[config] watch error: {e}");
-                        }
-                        _ => {}
                     }
-                }
-                let _ = done_tx.send(());
-            });
+                    let _ = done_tx.send(());
+                });
 
-            let _ = done_rx.await;
-        })
+                let _ = done_rx.await;
+            },
+        )
     })
 }
 
@@ -662,10 +708,17 @@ mod gui_tests {
         let colors = ColorConfig::default();
         // All default hex strings should parse without hitting magenta fallback
         let all_hex = [
-            &colors.bg_primary, &colors.bg_secondary, &colors.bg_sidebar,
-            &colors.bg_tab_active, &colors.bg_tab_hover, &colors.accent,
-            &colors.text_secondary, &colors.text_tab_active,
-            &colors.status_running, &colors.status_pending, &colors.status_idle,
+            &colors.bg_primary,
+            &colors.bg_secondary,
+            &colors.bg_sidebar,
+            &colors.bg_tab_active,
+            &colors.bg_tab_hover,
+            &colors.accent,
+            &colors.text_secondary,
+            &colors.text_tab_active,
+            &colors.status_running,
+            &colors.status_pending,
+            &colors.status_idle,
             &colors.focus_border,
         ];
         for hex in &all_hex {

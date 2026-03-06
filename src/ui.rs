@@ -85,8 +85,16 @@ pub struct AgentSlot {
 }
 
 impl AgentSlot {
-    pub fn new(id: usize, cmd: Vec<String>, label: String, config: &crate::config::AppConfig) -> Self {
-        let program = cmd.first().cloned().unwrap_or_else(|| config.shell.program.clone());
+    pub fn new(
+        id: usize,
+        cmd: Vec<String>,
+        label: String,
+        config: &crate::config::AppConfig,
+    ) -> Self {
+        let program = cmd
+            .first()
+            .cloned()
+            .unwrap_or_else(|| config.shell.program.clone());
         let args: Vec<String> = if cmd.len() > 1 {
             cmd.iter().skip(1).cloned().collect()
         } else if cmd.is_empty() {
@@ -264,7 +272,7 @@ impl State {
             death_cries_enabled: false,
         }));
 
-        Self {
+        let state = Self {
             slots: vec![slot],
             panes,
             focus: Some(first_pane),
@@ -276,7 +284,10 @@ impl State {
             collapsed_groups: std::collections::HashMap::new(),
             #[cfg(target_os = "macos")]
             vibrancy_applied: false,
-        }
+        };
+
+        state.sync_test_state();
+        state
     }
 
     /// The slot index of the focused pane, if any.
@@ -286,17 +297,24 @@ impl State {
 
     /// Check if a slot index is currently visible in any pane.
     fn slot_in_pane(&self, slot_idx: usize) -> Option<pane_grid::Pane> {
-        self.panes.iter().find_map(|(pane, &idx)| {
-            if idx == slot_idx { Some(*pane) } else { None }
-        })
+        self.panes.iter().find_map(
+            |(pane, &idx)| {
+                if idx == slot_idx {
+                    Some(*pane)
+                } else {
+                    None
+                }
+            },
+        )
     }
 
     /// Returns slot indices that are not tied to any golem preset.
     fn ad_hoc_slots(&self) -> Vec<(usize, &AgentSlot)> {
-        let golem_names: std::collections::HashSet<&str> = self.config.golem.iter()
-            .map(|g| g.name.as_str())
-            .collect();
-        self.slots.iter().enumerate()
+        let golem_names: std::collections::HashSet<&str> =
+            self.config.golem.iter().map(|g| g.name.as_str()).collect();
+        self.slots
+            .iter()
+            .enumerate()
             .filter(|(_, s)| !golem_names.contains(s.label.as_str()))
             .collect()
     }
@@ -314,7 +332,10 @@ impl State {
         }
 
         // Custom groups (not in known_order), sorted alphabetically
-        let mut custom: Vec<&String> = self.config.groups.keys()
+        let mut custom: Vec<&String> = self
+            .config
+            .groups
+            .keys()
             .filter(|k| !known_order.contains(&k.as_str()))
             .collect();
         custom.sort();
@@ -323,10 +344,16 @@ impl State {
         }
 
         // Check for ungrouped golems
-        let all_grouped: std::collections::HashSet<&str> = self.config.groups.values()
+        let all_grouped: std::collections::HashSet<&str> = self
+            .config
+            .groups
+            .values()
             .flat_map(|names| names.iter().map(|s| s.as_str()))
             .collect();
-        let has_ungrouped = self.config.golem.iter()
+        let has_ungrouped = self
+            .config
+            .golem
+            .iter()
             .any(|g| !all_grouped.contains(g.name.as_str()));
         if has_ungrouped {
             result.push("OTHER".into());
@@ -338,10 +365,16 @@ impl State {
     /// Returns golem configs belonging to a group. For "OTHER", returns ungrouped golems.
     pub fn golems_in_group(&self, group: &str) -> Vec<&crate::config::GolemConfig> {
         if group == "OTHER" {
-            let all_grouped: std::collections::HashSet<&str> = self.config.groups.values()
+            let all_grouped: std::collections::HashSet<&str> = self
+                .config
+                .groups
+                .values()
                 .flat_map(|names| names.iter().map(|s| s.as_str()))
                 .collect();
-            return self.config.golem.iter()
+            return self
+                .config
+                .golem
+                .iter()
                 .filter(|g| !all_grouped.contains(g.name.as_str()))
                 .collect();
         }
@@ -349,9 +382,48 @@ impl State {
             Some(names) => names,
             None => return vec![],
         };
-        names.iter()
+        names
+            .iter()
             .filter_map(|name| self.config.golem.iter().find(|g| &g.name == name))
             .collect()
+    }
+
+    fn terminal_content_text(terminal: &iced_term::Terminal) -> String {
+        let content = terminal.renderable_content();
+        let mut text = String::new();
+        let mut line = String::new();
+        let mut last_non_space = 0usize;
+        let mut current_line = None;
+
+        for indexed in content.grid.display_iter() {
+            let line_no = indexed.point.line.0;
+            if current_line != Some(line_no) {
+                if current_line.is_some() {
+                    line.truncate(last_non_space);
+                    text.push_str(&line);
+                    text.push('\n');
+                    line.clear();
+                    last_non_space = 0;
+                }
+                current_line = Some(line_no);
+            }
+
+            line.push(indexed.cell.c);
+            for ch in indexed.cell.zerowidth().into_iter().flatten() {
+                line.push(*ch);
+            }
+
+            if !matches!(indexed.cell.c, ' ') {
+                last_non_space = line.len();
+            }
+        }
+
+        if current_line.is_some() {
+            line.truncate(last_non_space);
+            text.push_str(&line);
+        }
+
+        text.trim_end_matches('\n').to_string()
     }
 
     fn sync_test_state(&self) {
@@ -363,7 +435,9 @@ impl State {
         if self.panes.len() > 1 {
             if let Some(focus) = self.focus {
                 // secondary = first pane that isn't the focused one
-                ts.split_secondary = self.panes.iter()
+                ts.split_secondary = self
+                    .panes
+                    .iter()
                     .find(|(p, _)| **p != focus)
                     .map(|(_, &idx)| idx)
                     .unwrap_or(0);
@@ -384,6 +458,11 @@ impl State {
                 SlotStatus::Pending => "pending".into(),
                 SlotStatus::Running => "ready".into(),
             };
+            ts.slots[i].content = slot
+                .terminal
+                .as_ref()
+                .map(Self::terminal_content_text)
+                .unwrap_or_default();
         }
     }
 
@@ -406,6 +485,7 @@ impl State {
                 if idx < self.slots.len() && self.slots[idx].status == SlotStatus::Idle {
                     self.slots[idx].launch();
                     if let Some(ref term) = self.slots[idx].terminal {
+                        self.sync_test_state();
                         return TerminalView::focus(term.widget_id().clone());
                     }
                 }
@@ -482,7 +562,9 @@ impl State {
 
                 // Update all pane references: any pane pointing to idx or above
                 // needs adjustment
-                let pane_updates: Vec<(pane_grid::Pane, usize)> = self.panes.iter()
+                let pane_updates: Vec<(pane_grid::Pane, usize)> = self
+                    .panes
+                    .iter()
                     .map(|(pane, &slot_idx)| {
                         let new_idx = if slot_idx == idx {
                             // This pane pointed to the removed slot — clamp
@@ -515,7 +597,9 @@ impl State {
                         } else {
                             (pane_grid::Direction::Left, pane_grid::Direction::Right)
                         };
-                        let adjacent = self.panes.adjacent(focused, primary)
+                        let adjacent = self
+                            .panes
+                            .adjacent(focused, primary)
                             .or_else(|| self.panes.adjacent(focused, fallback));
                         if let Some(adj) = adjacent {
                             self.focus = Some(adj);
@@ -576,7 +660,9 @@ impl State {
                     // Close all panes except focused
                     while self.panes.len() > 1 {
                         // Find a pane that isn't focused
-                        let to_close = self.panes.iter()
+                        let to_close = self
+                            .panes
+                            .iter()
                             .find(|(p, _)| Some(**p) != self.focus)
                             .map(|(p, _)| *p);
                         if let Some(pane) = to_close {
@@ -601,25 +687,23 @@ impl State {
                     let secondary = if self.slots.len() > 1 {
                         // Pick the first slot not currently shown
                         let current = self.active_slot_idx().unwrap_or(0);
-                        (0..self.slots.len())
-                            .find(|&i| i != current)
-                            .unwrap_or(0)
+                        (0..self.slots.len()).find(|&i| i != current).unwrap_or(0)
                     } else {
                         // Create a new slot
                         let id = self.next_slot_id;
                         self.next_slot_id += 1;
                         let label = format!("Agent {}", id + 1);
-                        let slot = AgentSlot::new(id, self.base_cmd.clone(), label, &self.config);                        self.slots.push(slot);
+                        let slot = AgentSlot::new(id, self.base_cmd.clone(), label, &self.config);
+                        self.slots.push(slot);
                         let mut ts = self.test_state.lock().unwrap();
                         ts.slots.push(crate::test_harness::SlotState::default());
                         drop(ts);
                         self.slots.len() - 1
                     };
-                    if let Some((new_pane, _)) = self.panes.split(
-                        pane_grid::Axis::Vertical,
-                        focused,
-                        secondary,
-                    ) {
+                    if let Some((new_pane, _)) =
+                        self.panes
+                            .split(pane_grid::Axis::Vertical, focused, secondary)
+                    {
                         self.focus = Some(new_pane);
                         if let Some(ref term) = self.slots[secondary].terminal {
                             self.sync_test_state();
@@ -721,7 +805,8 @@ impl State {
                 if let Some(golem) = golem {
                     let id = self.next_slot_id;
                     self.next_slot_id += 1;
-                    let mut slot = AgentSlot::new(id, golem.command.clone(), golem.name.clone(), &self.config);
+                    let mut slot =
+                        AgentSlot::new(id, golem.command.clone(), golem.name.clone(), &self.config);
 
                     // Set working directory to golem's repo
                     let repo_path = crate::config::expand_path(&golem.repo);
@@ -745,8 +830,11 @@ impl State {
             }
 
             Message::ConfigReloaded(new_config) => {
-                eprintln!("[config] reloaded: {} golems, {} groups",
-                    new_config.golem.len(), new_config.groups.len());
+                eprintln!(
+                    "[config] reloaded: {} golems, {} groups",
+                    new_config.golem.len(),
+                    new_config.groups.len()
+                );
                 self.config = new_config;
                 Task::none()
             }
@@ -780,23 +868,17 @@ impl State {
         // GUI shortcuts (Cmd-based, not forwarded to terminal)
         subscriptions.push(keyboard::listen().map(|event| match event {
             // Cmd+Alt+Left/Right → SwitchTab (cycles panes or tabs)
-            keyboard::Event::KeyPressed {
-                key, modifiers, ..
-            } if modifiers.command() && modifiers.alt() => match key {
-                keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => {
-                    Message::SwitchTab(-1)
+            keyboard::Event::KeyPressed { key, modifiers, .. }
+                if modifiers.command() && modifiers.alt() =>
+            {
+                match key {
+                    keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => Message::SwitchTab(-1),
+                    keyboard::Key::Named(keyboard::key::Named::ArrowRight) => Message::SwitchTab(1),
+                    keyboard::Key::Named(keyboard::key::Named::ArrowUp) => Message::SwitchTab(-1),
+                    keyboard::Key::Named(keyboard::key::Named::ArrowDown) => Message::SwitchTab(1),
+                    _ => Message::KeyboardIgnored,
                 }
-                keyboard::Key::Named(keyboard::key::Named::ArrowRight) => {
-                    Message::SwitchTab(1)
-                }
-                keyboard::Key::Named(keyboard::key::Named::ArrowUp) => {
-                    Message::SwitchTab(-1)
-                }
-                keyboard::Key::Named(keyboard::key::Named::ArrowDown) => {
-                    Message::SwitchTab(1)
-                }
-                _ => Message::KeyboardIgnored,
-            },
+            }
             // Cmd+Shift+D → split vertical
             keyboard::Event::KeyPressed {
                 key: keyboard::Key::Character(ref c),
@@ -816,9 +898,7 @@ impl State {
                 key: keyboard::Key::Character(ref c),
                 modifiers,
                 ..
-            } if c.as_ref() == "d" && modifiers.command() => {
-                Message::ToggleSplit
-            }
+            } if c.as_ref() == "d" && modifiers.command() => Message::ToggleSplit,
             // Cmd+W → close pane
             keyboard::Event::KeyPressed {
                 key: keyboard::Key::Character(ref c),
@@ -857,9 +937,7 @@ impl State {
         }));
 
         // Config file watcher for hot-reload
-        subscriptions.push(
-            crate::config::watch_config().map(Message::ConfigReloaded),
-        );
+        subscriptions.push(crate::config::watch_config().map(Message::ConfigReloaded));
 
         Subscription::batch(subscriptions)
     }
@@ -875,22 +953,21 @@ impl State {
             let is_focused = focus == Some(pane_id);
             let content = self.view_pane_content(slot_idx, is_focused);
 
-            pane_grid::Content::new(content)
-                .style(move |_theme| {
-                    let border_color = if is_focused {
-                        focus_border_color
-                    } else {
-                        iced::Color::TRANSPARENT
-                    };
-                    container::Style {
-                        border: iced::Border {
-                            color: border_color,
-                            width: if is_focused { 2.0 } else { 0.0 },
-                            ..Default::default()
-                        },
+            pane_grid::Content::new(content).style(move |_theme| {
+                let border_color = if is_focused {
+                    focus_border_color
+                } else {
+                    iced::Color::TRANSPARENT
+                };
+                container::Style {
+                    border: iced::Border {
+                        color: border_color,
+                        width: if is_focused { 2.0 } else { 0.0 },
                         ..Default::default()
-                    }
-                })
+                    },
+                    ..Default::default()
+                }
+            })
         })
         .width(Length::Fill)
         .height(Length::Fill)
@@ -917,11 +994,7 @@ impl State {
 
     // ── Pane Content ─────────────────────────────────────────────────────────
 
-    fn view_pane_content(
-        &self,
-        slot_idx: usize,
-        _is_focused: bool,
-    ) -> iced::Element<'_, Message> {
+    fn view_pane_content(&self, slot_idx: usize, _is_focused: bool) -> iced::Element<'_, Message> {
         let text_secondary = parse_hex_color(&self.config.ui.colors.text_secondary);
         let bg_primary = parse_hex_color(&self.config.ui.colors.bg_primary);
         let font_small = self.config.ui.font.small;
@@ -939,15 +1012,14 @@ impl State {
         let slot = &self.slots[slot_idx];
 
         let terminal_view: iced::Element<'_, Message> = if let Some(ref term) = slot.terminal {
-            container(
-                TerminalView::show(term).map(Message::TermEvent),
-            )
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(move |_theme| container::Style {
-                background: Some(iced::Background::Color(bg_primary)),                ..Default::default()
-            })
-            .into()
+            container(TerminalView::show(term).map(Message::TermEvent))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(move |_theme| container::Style {
+                    background: Some(iced::Background::Color(bg_primary)),
+                    ..Default::default()
+                })
+                .into()
         } else {
             // Idle state — show launch prompt
             let launch_text = column![
@@ -1016,19 +1088,19 @@ impl State {
         if has_golem_presets {
             // Render grouped golem presets
             for group_name in &groups {
-                let collapsed = self.collapsed_groups.get(group_name).copied().unwrap_or(false);
+                let collapsed = self
+                    .collapsed_groups
+                    .get(group_name)
+                    .copied()
+                    .unwrap_or(false);
                 let arrow = if collapsed { ">" } else { "v" };
                 let header_label = format!("{} {}", arrow, group_name.to_uppercase());
 
                 let group_name_clone = group_name.clone();
                 let group_header = button(
-                    container(
-                        text(header_label)
-                            .size(font_group)
-                            .color(text_secondary),
-                    )
-                    .padding([SPACING_TIGHT, SPACING_NORMAL])
-                    .width(Length::Fill),
+                    container(text(header_label).size(font_group).color(text_secondary))
+                        .padding([SPACING_TIGHT, SPACING_NORMAL])
+                        .width(Length::Fill),
                 )
                 .style(move |_theme, status| {
                     let mut style = iced::widget::button::Style {
@@ -1056,25 +1128,51 @@ impl State {
                     let golem_name = golem.name.clone();
 
                     // Check if this golem has a running slot
-                    let running_slot = self.slots.iter().enumerate()
+                    let running_slot = self
+                        .slots
+                        .iter()
+                        .enumerate()
                         .find(|(_, s)| s.label == golem.name);
 
-                    let (dot_color, label_color, bg, border_color, on_press, slot_idx) = if let Some((idx, slot)) = running_slot {
-                        let is_active = active_slot == Some(idx);
-                        let is_in_split = !is_active && visible_slots.contains(&idx);
-                        let dc = match slot.status {
-                            SlotStatus::Running => status_running,
-                            SlotStatus::Pending => status_pending,
-                            SlotStatus::Idle => status_idle,
+                    let (dot_color, label_color, bg, border_color, on_press, slot_idx) =
+                        if let Some((idx, slot)) = running_slot {
+                            let is_active = active_slot == Some(idx);
+                            let is_in_split = !is_active && visible_slots.contains(&idx);
+                            let dc = match slot.status {
+                                SlotStatus::Running => status_running,
+                                SlotStatus::Pending => status_pending,
+                                SlotStatus::Idle => status_idle,
+                            };
+                            let lc = if is_active || is_in_split {
+                                text_tab_active
+                            } else {
+                                text_secondary
+                            };
+                            let bg = if is_active {
+                                bg_tab_active
+                            } else if is_in_split {
+                                bg_tab_hover
+                            } else {
+                                iced::Color::TRANSPARENT
+                            };
+                            let bc = if is_active {
+                                golem_color
+                            } else if is_in_split {
+                                focus_border
+                            } else {
+                                iced::Color::TRANSPARENT
+                            };
+                            (dc, lc, bg, bc, Message::SelectTab(idx), Some(idx))
+                        } else {
+                            (
+                                status_idle,
+                                text_secondary,
+                                iced::Color::TRANSPARENT,
+                                iced::Color::TRANSPARENT,
+                                Message::LaunchGolem(golem_name.clone()),
+                                None,
+                            )
                         };
-                        let lc = if is_active || is_in_split { text_tab_active } else { text_secondary };
-                        let bg = if is_active { bg_tab_active } else if is_in_split { bg_tab_hover } else { iced::Color::TRANSPARENT };
-                        let bc = if is_active { golem_color } else if is_in_split { focus_border } else { iced::Color::TRANSPARENT };
-                        (dc, lc, bg, bc, Message::SelectTab(idx), Some(idx))
-                    } else {
-                        (status_idle, text_secondary, iced::Color::TRANSPARENT, iced::Color::TRANSPARENT,
-                         Message::LaunchGolem(golem_name.clone()), None)
-                    };
 
                     let icon_text = text(&golem.icon).size(font_tab);
                     let label = text(&golem.name).size(font_tab).color(label_color);
@@ -1094,7 +1192,9 @@ impl State {
                             border: iced::Border {
                                 color: border_color,
                                 width: if is_bordered { 2.0 } else { 0.0 },
-                                radius: iced::border::radius(0.0).top_right(BORDER_RADIUS).bottom_right(BORDER_RADIUS),
+                                radius: iced::border::radius(0.0)
+                                    .top_right(BORDER_RADIUS)
+                                    .bottom_right(BORDER_RADIUS),
                             },
                             ..Default::default()
                         })
@@ -1131,12 +1231,8 @@ impl State {
             // Separator before ad-hoc tabs
             if !self.ad_hoc_slots().is_empty() {
                 sidebar_content = sidebar_content.push(rule::horizontal(RULE_THICKNESS));
-                let adhoc_header = container(
-                    text("AD-HOC")
-                        .size(font_group)
-                        .color(text_secondary),
-                )
-                .padding([SPACING_TIGHT, SPACING_NORMAL]);
+                let adhoc_header = container(text("AD-HOC").size(font_group).color(text_secondary))
+                    .padding([SPACING_TIGHT, SPACING_NORMAL]);
                 sidebar_content = sidebar_content.push(adhoc_header);
             }
         }
@@ -1150,12 +1246,8 @@ impl State {
 
         if !has_golem_presets {
             // Legacy: flat "AGENTS" header when no golem presets configured
-            let group_header = container(
-                text("AGENTS")
-                    .size(font_group)
-                    .color(text_secondary),
-            )
-            .padding([SPACING_TIGHT, SPACING_NORMAL]);
+            let group_header = container(text("AGENTS").size(font_group).color(text_secondary))
+                .padding([SPACING_TIGHT, SPACING_NORMAL]);
             sidebar_content = sidebar_content.push(group_header);
         }
 
@@ -1202,12 +1294,10 @@ impl State {
                     background: Some(iced::Background::Color(bg)),
                     border: iced::Border {
                         color: border_color,
-                        width: if is_active || is_in_split {
-                            2.0
-                        } else {
-                            0.0
-                        },
-                        radius: iced::border::radius(0.0).top_right(BORDER_RADIUS).bottom_right(BORDER_RADIUS),
+                        width: if is_active || is_in_split { 2.0 } else { 0.0 },
+                        radius: iced::border::radius(0.0)
+                            .top_right(BORDER_RADIUS)
+                            .bottom_right(BORDER_RADIUS),
                     },
                     ..Default::default()
                 })
@@ -1230,7 +1320,8 @@ impl State {
         }
 
         // Spacer
-        sidebar_content = sidebar_content.push(Space::new().width(Length::Fill).height(Length::Fill));
+        sidebar_content =
+            sidebar_content.push(Space::new().width(Length::Fill).height(Length::Fill));
 
         // New tab button at bottom
         let new_tab_btn = button(
@@ -1289,13 +1380,9 @@ impl State {
         let status_dot = text("●").size(STATUS_DOT_SIZE).color(status_dot_color);
         let status_label = text(status).size(font_tiny).color(text_secondary);
 
-        let bar = row![
-            status_dot,
-            status_label,
-            Space::new().width(Length::Fill),
-        ]
-        .spacing(SPACING_TIGHT)
-        .align_y(iced::Alignment::Center);
+        let bar = row![status_dot, status_label, Space::new().width(Length::Fill),]
+            .spacing(SPACING_TIGHT)
+            .align_y(iced::Alignment::Center);
 
         container(bar.width(Length::Fill).padding([2.0, SPACING_NORMAL]))
             .style(move |_theme| container::Style {
@@ -1318,8 +1405,8 @@ fn apply_macos_vibrancy() {
     use std::ptr::NonNull;
 
     // This must be called from the main thread (Iced's update runs on main)
-    let mtm = MainThreadMarker::new()
-        .expect("apply_macos_vibrancy must be called from main thread");
+    let mtm =
+        MainThreadMarker::new().expect("apply_macos_vibrancy must be called from main thread");
 
     let app = NSApplication::sharedApplication(mtm);
     let Some(window) = (unsafe { app.keyWindow() }) else {
@@ -1340,7 +1427,10 @@ fn apply_macos_vibrancy() {
     impl iced::window::raw_window_handle::HasWindowHandle for NsViewHandle {
         fn window_handle(
             &self,
-        ) -> Result<iced::window::raw_window_handle::WindowHandle<'_>, iced::window::raw_window_handle::HandleError> {
+        ) -> Result<
+            iced::window::raw_window_handle::WindowHandle<'_>,
+            iced::window::raw_window_handle::HandleError,
+        > {
             let handle = iced::window::raw_window_handle::AppKitWindowHandle::new(self.0);
             Ok(unsafe { iced::window::raw_window_handle::WindowHandle::borrow_raw(handle.into()) })
         }
@@ -1494,7 +1584,11 @@ mod tests {
         let _ = state.update(Message::SelectTab(0));
         assert_eq!(active_slot(&state), 0);
         let _ = state.update(Message::SwitchTab(-1));
-        assert_eq!(active_slot(&state), 1, "SwitchTab(-1) from 0 should wrap to last");
+        assert_eq!(
+            active_slot(&state),
+            1,
+            "SwitchTab(-1) from 0 should wrap to last"
+        );
     }
 
     #[test]
@@ -1551,7 +1645,9 @@ mod tests {
         let mut state = State::new(vec!["echo".into()]);
         let _ = state.update(Message::SplitFocused(pane_grid::Axis::Horizontal));
         // Get the non-focused pane
-        let other = state.panes.iter()
+        let other = state
+            .panes
+            .iter()
             .find(|(p, _)| Some(**p) != state.focus)
             .map(|(p, _)| *p)
             .unwrap();
@@ -1621,7 +1717,10 @@ mod tests {
     #[test]
     fn collapsed_groups_initialized_empty() {
         let state = state_with_golems();
-        assert!(state.collapsed_groups.is_empty(), "all groups start expanded");
+        assert!(
+            state.collapsed_groups.is_empty(),
+            "all groups start expanded"
+        );
     }
 
     #[test]
@@ -1648,7 +1747,11 @@ mod tests {
         let mut state = state_with_golems();
         let initial_slots = state.slots.len();
         let _ = state.update(Message::LaunchGolem("nonexistent".into()));
-        assert_eq!(state.slots.len(), initial_slots, "unknown golem should not create slot");
+        assert_eq!(
+            state.slots.len(),
+            initial_slots,
+            "unknown golem should not create slot"
+        );
     }
 
     #[test]
@@ -1660,8 +1763,11 @@ mod tests {
         let wd = &new_slot.term_settings.backend.working_directory;
         assert!(wd.is_some(), "working directory should be set");
         let wd_path = wd.as_ref().unwrap();
-        assert!(wd_path.to_str().unwrap().contains("orchestrator"),
-            "working directory should contain repo path, got: {:?}", wd_path);
+        assert!(
+            wd_path.to_str().unwrap().contains("orchestrator"),
+            "working directory should contain repo path, got: {:?}",
+            wd_path
+        );
     }
 
     #[test]
@@ -1688,7 +1794,10 @@ mod tests {
             context_file: None,
         });
         let groups = state.ordered_groups();
-        assert!(groups.contains(&"OTHER".to_string()), "ungrouped golems should create OTHER group");
+        assert!(
+            groups.contains(&"OTHER".to_string()),
+            "ungrouped golems should create OTHER group"
+        );
     }
 
     #[test]
