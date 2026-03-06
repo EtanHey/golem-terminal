@@ -67,6 +67,8 @@ pub enum Message {
 
     // Sidebar
     ToggleSidebar,
+    ToggleGroup(String),
+    LaunchGolem(String),
 
     // Config hot-reload
     ConfigReloaded(crate::config::AppConfig),
@@ -240,6 +242,7 @@ pub struct State {
     pub next_slot_id: usize,
     pub test_state: Arc<Mutex<crate::test_harness::TestState>>,
     pub config: crate::config::AppConfig,
+    pub collapsed_groups: std::collections::HashMap<String, bool>,
     #[cfg(target_os = "macos")]
     vibrancy_applied: bool,
 }
@@ -270,6 +273,7 @@ impl State {
             next_slot_id: 1,
             test_state,
             config,
+            collapsed_groups: std::collections::HashMap::new(),
             #[cfg(target_os = "macos")]
             vibrancy_applied: false,
         }
@@ -285,6 +289,69 @@ impl State {
         self.panes.iter().find_map(|(pane, &idx)| {
             if idx == slot_idx { Some(*pane) } else { None }
         })
+    }
+
+    /// Returns slot indices that are not tied to any golem preset.
+    fn ad_hoc_slots(&self) -> Vec<(usize, &AgentSlot)> {
+        let golem_names: std::collections::HashSet<&str> = self.config.golem.iter()
+            .map(|g| g.name.as_str())
+            .collect();
+        self.slots.iter().enumerate()
+            .filter(|(_, s)| !golem_names.contains(s.label.as_str()))
+            .collect()
+    }
+
+    /// Returns group names in display order: orchestrators, workers, tools, then
+    /// any custom groups alphabetically, then "OTHER" if ungrouped golems exist.
+    pub fn ordered_groups(&self) -> Vec<String> {
+        let mut result = Vec::new();
+        let known_order = ["orchestrators", "workers", "tools"];
+
+        for name in &known_order {
+            if self.config.groups.contains_key(*name) {
+                result.push(name.to_string());
+            }
+        }
+
+        // Custom groups (not in known_order), sorted alphabetically
+        let mut custom: Vec<&String> = self.config.groups.keys()
+            .filter(|k| !known_order.contains(&k.as_str()))
+            .collect();
+        custom.sort();
+        for name in custom {
+            result.push(name.clone());
+        }
+
+        // Check for ungrouped golems
+        let all_grouped: std::collections::HashSet<&str> = self.config.groups.values()
+            .flat_map(|names| names.iter().map(|s| s.as_str()))
+            .collect();
+        let has_ungrouped = self.config.golem.iter()
+            .any(|g| !all_grouped.contains(g.name.as_str()));
+        if has_ungrouped {
+            result.push("OTHER".into());
+        }
+
+        result
+    }
+
+    /// Returns golem configs belonging to a group. For "OTHER", returns ungrouped golems.
+    pub fn golems_in_group(&self, group: &str) -> Vec<&crate::config::GolemConfig> {
+        if group == "OTHER" {
+            let all_grouped: std::collections::HashSet<&str> = self.config.groups.values()
+                .flat_map(|names| names.iter().map(|s| s.as_str()))
+                .collect();
+            return self.config.golem.iter()
+                .filter(|g| !all_grouped.contains(g.name.as_str()))
+                .collect();
+        }
+        let names = match self.config.groups.get(group) {
+            Some(names) => names,
+            None => return vec![],
+        };
+        names.iter()
+            .filter_map(|name| self.config.golem.iter().find(|g| &g.name == name))
+            .collect()
     }
 
     fn sync_test_state(&self) {
@@ -643,6 +710,40 @@ impl State {
                 Task::none()
             }
 
+            Message::ToggleGroup(name) => {
+                let collapsed = self.collapsed_groups.entry(name).or_insert(false);
+                *collapsed = !*collapsed;
+                Task::none()
+            }
+
+            Message::LaunchGolem(name) => {
+                let golem = self.config.golem.iter().find(|g| g.name == name).cloned();
+                if let Some(golem) = golem {
+                    let id = self.next_slot_id;
+                    self.next_slot_id += 1;
+                    let mut slot = AgentSlot::new(id, golem.command.clone(), golem.name.clone(), &self.config);
+
+                    // Set working directory to golem's repo
+                    let repo_path = crate::config::expand_path(&golem.repo);
+                    slot.term_settings.backend.working_directory = Some(repo_path);
+
+                    self.slots.push(slot);
+                    let new_idx = self.slots.len() - 1;
+
+                    // Update focused pane to show the new slot
+                    if let Some(focused) = self.focus {
+                        if let Some(slot_ref) = self.panes.get_mut(focused) {
+                            *slot_ref = new_idx;
+                        }
+                    }
+
+                    let mut ts = self.test_state.lock().unwrap();
+                    ts.slots.push(crate::test_harness::SlotState::default());
+                    drop(ts);
+                }
+                Task::none()
+            }
+
             Message::ConfigReloaded(new_config) => {
                 eprintln!("[config] reloaded: {} golems, {} groups",
                     new_config.golem.len(), new_config.groups.len());
@@ -898,7 +999,6 @@ impl State {
         let bg_tab_hover = parse_hex_color(&colors.bg_tab_hover);
         let accent_color = parse_hex_color(&colors.accent);
         let focus_border = parse_hex_color(&colors.focus_border);
-        // Sidebar has alpha < 1.0 so macOS vibrancy shows through
         let bg_sidebar = parse_hex_color_alpha(&colors.bg_sidebar, 0.7);
         let sidebar_width = self.config.ui.sidebar_width;
         let font_group = font.group;
@@ -907,25 +1007,162 @@ impl State {
 
         let mut sidebar_content = column![].spacing(2.0).padding([SPACING_NORMAL, 0.0]);
 
-        // Group header: "Agents"
-        let group_header = container(
-            text("AGENTS")
-                .size(font_group)
-                .color(text_secondary),
-        )
-        .padding([SPACING_TIGHT, SPACING_NORMAL]);
-        sidebar_content = sidebar_content.push(group_header);
-
         let active_slot = self.active_slot_idx();
-        // Collect all slot indices currently visible in panes
         let visible_slots: Vec<usize> = self.panes.iter().map(|(_, idx)| *idx).collect();
 
-        // Tab entries
-        for (i, slot) in self.slots.iter().enumerate() {
+        let groups = self.ordered_groups();
+        let has_golem_presets = !self.config.golem.is_empty();
+
+        if has_golem_presets {
+            // Render grouped golem presets
+            for group_name in &groups {
+                let collapsed = self.collapsed_groups.get(group_name).copied().unwrap_or(false);
+                let arrow = if collapsed { ">" } else { "v" };
+                let header_label = format!("{} {}", arrow, group_name.to_uppercase());
+
+                let group_name_clone = group_name.clone();
+                let group_header = button(
+                    container(
+                        text(header_label)
+                            .size(font_group)
+                            .color(text_secondary),
+                    )
+                    .padding([SPACING_TIGHT, SPACING_NORMAL])
+                    .width(Length::Fill),
+                )
+                .style(move |_theme, status| {
+                    let mut style = iced::widget::button::Style {
+                        background: None,
+                        ..Default::default()
+                    };
+                    if matches!(status, iced::widget::button::Status::Hovered) {
+                        style.background = Some(iced::Background::Color(bg_tab_hover));
+                    }
+                    style
+                })
+                .padding(0)
+                .width(Length::Fill)
+                .on_press(Message::ToggleGroup(group_name_clone));
+
+                sidebar_content = sidebar_content.push(group_header);
+
+                if collapsed {
+                    continue;
+                }
+
+                let golems = self.golems_in_group(group_name);
+                for golem in golems {
+                    let golem_color = parse_hex_color(&golem.color);
+                    let golem_name = golem.name.clone();
+
+                    // Check if this golem has a running slot
+                    let running_slot = self.slots.iter().enumerate()
+                        .find(|(_, s)| s.label == golem.name);
+
+                    let (dot_color, label_color, bg, border_color, on_press, slot_idx) = if let Some((idx, slot)) = running_slot {
+                        let is_active = active_slot == Some(idx);
+                        let is_in_split = !is_active && visible_slots.contains(&idx);
+                        let dc = match slot.status {
+                            SlotStatus::Running => status_running,
+                            SlotStatus::Pending => status_pending,
+                            SlotStatus::Idle => status_idle,
+                        };
+                        let lc = if is_active || is_in_split { text_tab_active } else { text_secondary };
+                        let bg = if is_active { bg_tab_active } else if is_in_split { bg_tab_hover } else { iced::Color::TRANSPARENT };
+                        let bc = if is_active { golem_color } else if is_in_split { focus_border } else { iced::Color::TRANSPARENT };
+                        (dc, lc, bg, bc, Message::SelectTab(idx), Some(idx))
+                    } else {
+                        (status_idle, text_secondary, iced::Color::TRANSPARENT, iced::Color::TRANSPARENT,
+                         Message::LaunchGolem(golem_name.clone()), None)
+                    };
+
+                    let icon_text = text(&golem.icon).size(font_tab);
+                    let label = text(&golem.name).size(font_tab).color(label_color);
+                    let dot = text("●").size(STATUS_DOT_SIZE).color(dot_color);
+
+                    let tab_row = row![icon_text, label, Space::new().width(Length::Fill), dot]
+                        .spacing(SPACING_TIGHT)
+                        .align_y(iced::Alignment::Center);
+
+                    let is_bordered = slot_idx.map_or(false, |idx| {
+                        active_slot == Some(idx) || visible_slots.contains(&idx)
+                    });
+
+                    let tab_container = container(tab_row)
+                        .style(move |_theme| container::Style {
+                            background: Some(iced::Background::Color(bg)),
+                            border: iced::Border {
+                                color: border_color,
+                                width: if is_bordered { 2.0 } else { 0.0 },
+                                radius: iced::border::radius(0.0).top_right(BORDER_RADIUS).bottom_right(BORDER_RADIUS),
+                            },
+                            ..Default::default()
+                        })
+                        .padding([SPACING_TIGHT, SPACING_NORMAL + 8.0]) // indent under group
+                        .width(Length::Fill);
+
+                    let tab_element: iced::Element<'_, Message> = if let Some(idx) = slot_idx {
+                        mouse_area(
+                            button(tab_container)
+                                .style(|_theme, _status| iced::widget::button::Style {
+                                    background: None,
+                                    ..Default::default()
+                                })
+                                .padding(0)
+                                .on_press(on_press),
+                        )
+                        .on_middle_press(Message::CloseTab(idx))
+                        .into()
+                    } else {
+                        button(tab_container)
+                            .style(|_theme, _status| iced::widget::button::Style {
+                                background: None,
+                                ..Default::default()
+                            })
+                            .padding(0)
+                            .on_press(on_press)
+                            .into()
+                    };
+
+                    sidebar_content = sidebar_content.push(tab_element);
+                }
+            }
+
+            // Separator before ad-hoc tabs
+            if !self.ad_hoc_slots().is_empty() {
+                sidebar_content = sidebar_content.push(rule::horizontal(RULE_THICKNESS));
+                let adhoc_header = container(
+                    text("AD-HOC")
+                        .size(font_group)
+                        .color(text_secondary),
+                )
+                .padding([SPACING_TIGHT, SPACING_NORMAL]);
+                sidebar_content = sidebar_content.push(adhoc_header);
+            }
+        }
+
+        // Ad-hoc tabs (slots not tied to a golem preset) or all tabs if no presets
+        let adhoc_slots: Vec<(usize, &AgentSlot)> = if has_golem_presets {
+            self.ad_hoc_slots()
+        } else {
+            self.slots.iter().enumerate().collect()
+        };
+
+        if !has_golem_presets {
+            // Legacy: flat "AGENTS" header when no golem presets configured
+            let group_header = container(
+                text("AGENTS")
+                    .size(font_group)
+                    .color(text_secondary),
+            )
+            .padding([SPACING_TIGHT, SPACING_NORMAL]);
+            sidebar_content = sidebar_content.push(group_header);
+        }
+
+        for (i, slot) in adhoc_slots {
             let is_active = active_slot == Some(i);
             let is_in_split = !is_active && visible_slots.contains(&i);
 
-            // Status dot
             let dot_color = match slot.status {
                 SlotStatus::Running => status_running,
                 SlotStatus::Pending => status_pending,
@@ -933,7 +1170,6 @@ impl State {
             };
             let dot = text("●").size(STATUS_DOT_SIZE).color(dot_color);
 
-            // Label
             let label_color = if is_active || is_in_split {
                 text_tab_active
             } else {
@@ -945,7 +1181,6 @@ impl State {
                 .spacing(SPACING_NORMAL)
                 .align_y(iced::Alignment::Center);
 
-            // Background
             let bg = if is_active {
                 bg_tab_active
             } else if is_in_split {
@@ -954,7 +1189,6 @@ impl State {
                 iced::Color::TRANSPARENT
             };
 
-            // Left accent border for active tab
             let border_color = if is_active {
                 accent_color
             } else if is_in_split {
@@ -980,7 +1214,6 @@ impl State {
                 .padding([SPACING_TIGHT, SPACING_NORMAL])
                 .width(Length::Fill);
 
-            // Middle-click to close, regular click to select
             let tab_element: iced::Element<'_, Message> = mouse_area(
                 button(tab_container)
                     .style(|_theme, _status| iced::widget::button::Style {
@@ -1342,5 +1575,127 @@ mod tests {
         let _ = state.update(Message::NewTab);
         // New tabs should be idle, not auto-launched
         assert_eq!(state.slots[1].status, SlotStatus::Idle);
+    }
+
+    // ── Phase 4: RepoGolem Sidebar Tests ────────────────────────────────────
+
+    fn state_with_golems() -> State {
+        let mut state = State::new(vec!["echo".into()]);
+        state.config.golem = vec![
+            crate::config::GolemConfig {
+                name: "orcClaude".into(),
+                repo: "~/Gits/orchestrator".into(),
+                icon: "O".into(),
+                color: "#7C3AED".into(),
+                golem_type: crate::config::GolemType::Orchestrator,
+                command: vec!["echo".into(), "orc".into()],
+                context_file: None,
+            },
+            crate::config::GolemConfig {
+                name: "brainClaude".into(),
+                repo: "~/Gits/brainlayer".into(),
+                icon: "B".into(),
+                color: "#06B6D4".into(),
+                golem_type: crate::config::GolemType::Worker,
+                command: vec!["echo".into(), "brain".into()],
+                context_file: None,
+            },
+            crate::config::GolemConfig {
+                name: "Cursor Audit".into(),
+                repo: "~/Gits".into(),
+                icon: "C".into(),
+                color: "#6B7280".into(),
+                golem_type: crate::config::GolemType::Tool,
+                command: vec!["echo".into(), "cursor".into()],
+                context_file: None,
+            },
+        ];
+        state.config.groups = std::collections::HashMap::from([
+            ("orchestrators".into(), vec!["orcClaude".into()]),
+            ("workers".into(), vec!["brainClaude".into()]),
+            ("tools".into(), vec!["Cursor Audit".into()]),
+        ]);
+        state
+    }
+
+    #[test]
+    fn collapsed_groups_initialized_empty() {
+        let state = state_with_golems();
+        assert!(state.collapsed_groups.is_empty(), "all groups start expanded");
+    }
+
+    #[test]
+    fn toggle_group_collapses_and_expands() {
+        let mut state = state_with_golems();
+        let _ = state.update(Message::ToggleGroup("workers".into()));
+        assert_eq!(state.collapsed_groups.get("workers"), Some(&true));
+        let _ = state.update(Message::ToggleGroup("workers".into()));
+        assert_eq!(state.collapsed_groups.get("workers"), Some(&false));
+    }
+
+    #[test]
+    fn launch_golem_creates_slot_with_golem_settings() {
+        let mut state = state_with_golems();
+        let initial_slots = state.slots.len();
+        let _ = state.update(Message::LaunchGolem("orcClaude".into()));
+        assert_eq!(state.slots.len(), initial_slots + 1);
+        let new_slot = state.slots.last().unwrap();
+        assert_eq!(new_slot.label, "orcClaude");
+    }
+
+    #[test]
+    fn launch_golem_unknown_name_is_noop() {
+        let mut state = state_with_golems();
+        let initial_slots = state.slots.len();
+        let _ = state.update(Message::LaunchGolem("nonexistent".into()));
+        assert_eq!(state.slots.len(), initial_slots, "unknown golem should not create slot");
+    }
+
+    #[test]
+    fn launch_golem_sets_working_directory() {
+        let mut state = state_with_golems();
+        let _ = state.update(Message::LaunchGolem("orcClaude".into()));
+        let new_slot = state.slots.last().unwrap();
+        // The BackendSettings should have the expanded repo path as working_directory
+        let wd = &new_slot.term_settings.backend.working_directory;
+        assert!(wd.is_some(), "working directory should be set");
+        let wd_path = wd.as_ref().unwrap();
+        assert!(wd_path.to_str().unwrap().contains("orchestrator"),
+            "working directory should contain repo path, got: {:?}", wd_path);
+    }
+
+    #[test]
+    fn ordered_groups_returns_correct_order() {
+        let state = state_with_golems();
+        let groups = state.ordered_groups();
+        // orchestrators first, workers second, tools third
+        assert_eq!(groups[0], "orchestrators");
+        assert_eq!(groups[1], "workers");
+        assert_eq!(groups[2], "tools");
+    }
+
+    #[test]
+    fn ungrouped_golems_go_to_other() {
+        let mut state = state_with_golems();
+        // Add a golem not in any group
+        state.config.golem.push(crate::config::GolemConfig {
+            name: "stray".into(),
+            repo: "~/stray".into(),
+            icon: "S".into(),
+            color: "#000000".into(),
+            golem_type: crate::config::GolemType::Worker,
+            command: vec![],
+            context_file: None,
+        });
+        let groups = state.ordered_groups();
+        assert!(groups.contains(&"OTHER".to_string()), "ungrouped golems should create OTHER group");
+    }
+
+    #[test]
+    fn golems_in_group_returns_matching_configs() {
+        let state = state_with_golems();
+        let workers = state.golems_in_group("workers");
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].name, "brainClaude");
     }
 }

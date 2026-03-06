@@ -303,14 +303,33 @@ pub fn ensure_default_config() {
 # Each [[golem]] defines an agent preset shown in the sidebar.
 # Groups organize golems into collapsible sections.
 
-# Example:
+# ── Golem Presets ─────────────────────────────
+
 # [[golem]]
 # name = "orcClaude"
 # repo = "~/Gits/orchestrator"
 # icon = "🎭"
 # color = "#7C3AED"
 # type = "orchestrator"
-# command = ["claude", "code"]
+# command = ["claude", "-s"]
+
+# [[golem]]
+# name = "brainClaude"
+# repo = "~/Gits/brainlayer"
+# icon = "🧠"
+# color = "#06B6D4"
+# type = "worker"
+# command = ["claude", "-s"]
+
+# [[golem]]
+# name = "golemsClaude"
+# repo = "~/Gits/golems"
+# icon = "📦"
+# color = "#F59E0B"
+# type = "worker"
+# command = ["claude", "-s"]
+
+# ── Groups ────────────────────────────────────
 
 # [groups]
 # orchestrators = ["orcClaude"]
