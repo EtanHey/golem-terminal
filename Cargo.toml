@@ -1,6 +1,6 @@
 [package]
 name = "golem-terminal"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [[bin]]
@@ -9,20 +9,30 @@ path = "src/main.rs"
 
 [features]
 default = []
-gui = ["dep:iced", "dep:futures", "dep:vt100", "dep:serde", "dep:serde_json", "dep:image"]
+gui = ["dep:iced", "dep:iced_term", "dep:futures", "dep:image", "dep:tokio", "dep:window-vibrancy", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation", "dep:notify"]
 
 [dependencies]
 clap         = { version = "4", features = ["derive"] }
 portable-pty = "0.9"
 libc         = "0.2"
 anyhow       = "1"
-iced         = { version = "0.14", optional = true, features = ["image", "tokio"] }
+iced         = { version = "0.14", optional = true, features = ["canvas", "lazy", "advanced", "image", "tokio"] }
+iced_term    = { git = "https://github.com/EtanHey/iced_term", branch = "feat/pub-backend-async-drop", optional = true }
 futures      = { version = "0.3",  optional = true }
-vt100        = { version = "0.16", optional = true }
-serde        = { version = "1", features = ["derive"], optional = true }
-serde_json   = { version = "1", optional = true }
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+figment      = { version = "0.10", features = ["toml", "env"] }
+toml         = "0.8"
+dirs         = "6"
+notify       = { version = "7", optional = true }
 image        = { version = "0.25", optional = true, default-features = false, features = ["png"] }
-tokio        = { version = "1", features = ["rt-multi-thread"] }
+tokio        = { version = "1", features = ["rt-multi-thread"], optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+window-vibrancy   = { version = "0.7", optional = true }
+objc2             = { version = "0.6", optional = true }
+objc2-app-kit     = { version = "0.3", optional = true, features = ["NSApplication", "NSWindow", "NSView", "NSResponder"] }
+objc2-foundation  = { version = "0.3", optional = true, features = ["NSGeometry"] }
 
 [profile.release]
 strip = true

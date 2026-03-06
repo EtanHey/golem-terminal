@@ -1,3 +1,4 @@
+mod config;
 mod pty;
 mod session;
 #[cfg(feature = "gui")]
@@ -44,8 +45,11 @@ fn main() -> anyhow::Result<()> {
         #[cfg(feature = "gui")]
         Commands::Ui { cmd } => {
             let cmd = if cmd.is_empty() {
-                vec!["claude".into(), "--dangerously-skip-permissions".into()]
-            } else {
+                // Use shell from config (defaults to /bin/zsh -l)
+                let cfg = config::load().unwrap_or_default();
+                let mut shell_cmd = vec![cfg.shell.program];
+                shell_cmd.extend(cfg.shell.args);
+                shell_cmd            } else {
                 cmd
             };
             ui::run(cmd)

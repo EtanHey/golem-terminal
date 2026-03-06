@@ -1,740 +1,657 @@
-// Golem Terminal — Tab-based terminal multiplexer built on Iced
+// Golem Terminal V2 — Tab-based terminal multiplexer built on Iced + iced_term
 //
-// AIDEV-NOTE: Forked from seshat-swarm. Game layer stripped.
-// Core: PTY sessions via portable-pty, VT100 parsing, Iced GUI.
-// Layout: Tab bar at top, full-width terminal below.
-// Split screen: optional 50/50 horizontal split.
+// V2 uses iced_term (alacritty_terminal backend) for proper terminal rendering
+// with colors, cursor, selection, scrollback. Sidebar navigation (Zen browser
+// style) replaces top tab bar. pane_grid provides recursive splits.
 
-use iced::widget::{
-    button, column, container, mouse_area, row, rule, scrollable, text,
-};
-use iced::{clipboard, keyboard, Length, Subscription, Task};
+use iced::widget::pane_grid::{self, PaneGrid};
+use iced::widget::{button, column, container, mouse_area, row, rule, text, Space};
+use iced::{keyboard, Length, Subscription, Task};
 use std::sync::{Arc, Mutex};
 
-use crate::session::SessionHandle;
+use iced_term::bindings::{Binding, BindingAction, InputKind};
+use iced_term::TerminalView;
 
-// ── Constants ────────────────────────────────────────────────────────────────
+use crate::config::{parse_hex_color, parse_hex_color_alpha};
 
-// Terminal dimensions
-const VT_COLS: u16 = 120;
-const VT_ROWS: u16 = 24;
-const VT_SCROLLBACK: usize = 1000;
+// ── Constants (non-themed, not in config) ───────────────────────────────────
 
-// Font sizes
-const FONT_BODY: f32 = 14.0;
-const FONT_SMALL: f32 = 12.0;
-const FONT_TINY: f32 = 10.0;
-const FONT_TAB: f32 = 13.0;
-
-// Spacing
+// Spacing (small enough to not warrant config)
 const SPACING_TIGHT: f32 = 4.0;
 const SPACING_NORMAL: f32 = 8.0;
 
-// Layout
-const TAB_BAR_HEIGHT: f32 = 36.0;
-const BOTTOM_BAR_HEIGHT: f32 = 24.0;
-const TAB_PADDING: [f32; 2] = [8.0, 12.0]; // vertical, horizontal
+// Layout (fixed structural values)
 const BORDER_RADIUS: f32 = 4.0;
-const BORDER_WIDTH: f32 = 1.0;
 const RULE_THICKNESS: f32 = 1.0;
+const STATUS_DOT_SIZE: f32 = 8.0;
+const PANE_RESIZE_GRAB_AREA: f32 = 6.0;
 
-// Colors (iTerm-inspired dark theme)
-const BG_PRIMARY: iced::Color = iced::Color::from_rgb(0.11, 0.11, 0.14);
-const BG_SECONDARY: iced::Color = iced::Color::from_rgb(0.15, 0.15, 0.19);
-const BG_TAB_ACTIVE: iced::Color = iced::Color::from_rgb(0.18, 0.18, 0.22);
-const BG_TAB_INACTIVE: iced::Color = iced::Color::from_rgb(0.13, 0.13, 0.16);
-const TEXT_PRIMARY: iced::Color = iced::Color::from_rgb(0.87, 0.87, 0.87);
-const TEXT_SECONDARY: iced::Color = iced::Color::from_rgb(0.55, 0.55, 0.60);
-const TEXT_TAB_ACTIVE: iced::Color = iced::Color::from_rgb(0.95, 0.95, 0.95);
-const ACCENT_COLOR: iced::Color = iced::Color::from_rgb(0.40, 0.60, 0.95);
-const KILL_BUTTON_COLOR: iced::Color = iced::Color::from_rgb(0.9, 0.3, 0.3);
-const HOVER_ALPHA: f32 = 0.15;
-const DISABLED_ALPHA: f32 = 0.3;
+// ── Slot Status ──────────────────────────────────────────────────────────────
 
-// Status detection
-const CLAUDE_CODE_BANNER_PREFIX: &str = "╭─";
-const CLAUDE_CODE_STATUS_PREFIX: &str = "⏺";
-
-// Bracketed paste
-const BRACKETED_PASTE_START: &str = "\x1b[200~";
-const BRACKETED_PASTE_END: &str = "\x1b[201~";
-
-// Byte size labels
-const KB: usize = 1024;
-const MB: usize = 1024 * 1024;
-
-// Mode badge
-const MODE_BADGE_FONT: f32 = 10.0;
-const MODE_BADGE_RADIUS: f32 = 3.0;
-const MODE_BADGE_PADDING: [f32; 2] = [2.0, 6.0];
-const MODE_TEXT_COLOR: iced::Color = iced::Color::WHITE;
+#[derive(Debug, Clone, PartialEq)]
+pub enum SlotStatus {
+    Idle,
+    Pending,
+    Running,
+}
 
 // ── Messages ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    // Session lifecycle
-    Launch(usize),
-    SessionSpawned(usize),
-    LaunchFailed(usize),
-    Kill(usize),
-    OutputChunk { slot: usize, data: Vec<u8> },
-    OutputDone(usize),
-
-    // Input
-    SendInput(usize, String),
-    PtyKeystroke(String),
-    PtyPaste,
-    PtyPasteResult(Option<String>),
-
-    // Tab management
+    // Tab management (sidebar)
     SelectTab(usize),
     NewTab,
     CloseTab(usize),
-    SwitchTab(i32), // +1 or -1
+    SwitchTab(i32),
 
-    // View modes
-    ToggleView(usize),
-    ToggleSplit, // toggle split screen
+    // Pane grid
+    PaneClicked(pane_grid::Pane),
+    PaneDragged(pane_grid::DragEvent),
+    PaneResized(pane_grid::ResizeEvent),
+    SplitFocused(pane_grid::Axis),
+    ClosePane,
+    ToggleSplit, // backward compat: toggle between 1-pane and 2-pane
 
-    // System
-    KeyboardIgnored,
+    // Terminal lifecycle
+    LaunchSlot(usize),
+    KillSlot(usize),
+    SendInput(usize, String),
+
+    // iced_term events (forwarded per terminal instance)
+    TermEvent(iced_term::Event),
+
+    // Window
     Quit,
-}
+    KeyboardIgnored,
 
-// ── Agent Status ─────────────────────────────────────────────────────────────
+    // Sidebar
+    ToggleSidebar,
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum AgentStatus {
-    Idle,
-    Pending,
-    Ready(std::time::Instant),
-}
-
-// ── Output View Mode ─────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum OutputView {
-    Filtered,
-    Raw,
-}
-
-// ── Permission Mode Detection ────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy)]
-pub enum PermissionMode {
-    Normal,
-    Plan,
-    Bash,
-}
-
-impl PermissionMode {
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::Normal => "Normal",
-            Self::Plan => "Plan",
-            Self::Bash => "Bash",
-        }
-    }
-
-    pub fn color(&self) -> iced::Color {
-        match self {
-            Self::Normal => iced::Color::from_rgb(0.2, 0.6, 0.3),
-            Self::Plan => iced::Color::from_rgb(0.6, 0.5, 0.2),
-            Self::Bash => iced::Color::from_rgb(0.7, 0.3, 0.2),
-        }
-    }
-}
-
-fn detect_permission_mode(status: &str) -> Option<PermissionMode> {
-    let lower = status.to_lowercase();
-    if lower.contains("plan mode") {
-        Some(PermissionMode::Plan)
-    } else if lower.contains("bash") {
-        Some(PermissionMode::Bash)
-    } else if lower.contains("normal") || lower.contains("auto") {
-        Some(PermissionMode::Normal)
-    } else {
-        None
-    }
+    // Config hot-reload
+    ConfigReloaded(crate::config::AppConfig),
 }
 
 // ── Agent Slot ───────────────────────────────────────────────────────────────
 
 pub struct AgentSlot {
     pub id: usize,
-    pub cmd: Vec<String>,
     pub label: String,
-    pub status: AgentStatus,
-    pub session: Option<SessionHandle>,
-    pub session_mailbox: Arc<Mutex<Option<(SessionHandle, Vec<u8>)>>>,
-    pub vt_parser: vt100::Parser,
-    pub output_log: Vec<u8>,
-    pub output_view: OutputView,
-    pub display_cache: String,
-    pub raw_log_cache: String,
-    content_range: Option<(usize, usize)>,
+    pub status: SlotStatus,
+    pub terminal: Option<iced_term::Terminal>,
+    pub term_settings: iced_term::settings::Settings,
 }
 
 impl AgentSlot {
-    pub fn new(id: usize, cmd: Vec<String>, label: String) -> Self {
+    pub fn new(id: usize, cmd: Vec<String>, label: String, config: &crate::config::AppConfig) -> Self {
+        let program = cmd.first().cloned().unwrap_or_else(|| config.shell.program.clone());
+        let args: Vec<String> = if cmd.len() > 1 {
+            cmd.iter().skip(1).cloned().collect()
+        } else if cmd.is_empty() {
+            config.shell.args.clone()
+        } else {
+            // cmd has exactly 1 element (the program), no extra args
+            vec![]
+        };
+
+        let term_settings = iced_term::settings::Settings {
+            font: iced_term::settings::FontSettings {
+                size: config.ui.font.terminal,
+                font_type: iced::Font::MONOSPACE,
+                ..Default::default()
+            },
+            theme: iced_term::settings::ThemeSettings::new(Box::new(iterm_color_palette())),
+            backend: iced_term::settings::BackendSettings {
+                program,
+                args,
+                ..Default::default()
+            },
+        };
+
         Self {
             id,
-            cmd,
             label,
-            status: AgentStatus::Idle,
-            session: None,
-            session_mailbox: Arc::new(Mutex::new(None)),
-            vt_parser: vt100::Parser::new(VT_ROWS, VT_COLS, VT_SCROLLBACK),
-            output_log: Vec::new(),
-            output_view: OutputView::Filtered,
-            display_cache: String::new(),
-            raw_log_cache: String::new(),
-            content_range: None,
+            status: SlotStatus::Idle,
+            terminal: None,
+            term_settings,
         }
     }
 
-    pub fn append_output(&mut self, data: &[u8]) {
-        self.output_log.extend_from_slice(data);
-        self.vt_parser.process(data);
-        self.rebuild_caches();
-    }
-
-    fn rebuild_caches(&mut self) {
-        let screen = self.vt_parser.screen();
-        let full = screen.contents();
-
-        // Compute content range — strip Claude Code banner and status bar
-        self.content_range = compute_content_range(&full);
-        self.display_cache = match self.content_range {
-            Some((start, end)) => compute_display_text(screen, start, end),
-            None => full,
-        };
-    }
-
-    pub fn content_text(&self) -> String {
-        self.display_cache.clone()
-    }
-
-    pub fn status_text(&self) -> String {
-        let screen = self.vt_parser.screen();
-        let full = screen.contents();
-        full.lines()
-            .rev()
-            .find(|l| !l.trim().is_empty())
-            .unwrap_or("")
-            .to_string()
-    }
-
-    fn load_raw_log(&mut self) {
-        self.raw_log_cache = String::from_utf8_lossy(&self.output_log).to_string();
-    }
-
-    pub fn log_input(&self, _data: &[u8]) {
-        // Could log input for debugging, currently a no-op
-    }
-
-    pub fn launch(&mut self) -> Task<Message> {
-        if self.status != AgentStatus::Idle {
-            return Task::none();
+    pub fn launch(&mut self) {
+        if self.terminal.is_some() {
+            return;
         }
-        self.status = AgentStatus::Pending;
-
-        let cmd = self.cmd.clone();
-        let slot = self.id;
-        let mailbox = self.session_mailbox.clone();
-
-        Task::perform(
-            async move {
-                tokio::task::spawn_blocking(move || {
-                    match crate::session::spawn(cmd) {
-                        Ok(handle) => {
-                            *mailbox.lock().unwrap() = Some((handle, vec![]));
-                            slot
-                        }
-                        Err(_) => slot,
-                    }
-                })
-                .await
-                .unwrap_or(slot)
-            },
-            Message::SessionSpawned,
-        )
-    }
-
-    pub fn session_spawned(&mut self) -> Task<Message> {
-        let entry = self.session_mailbox.lock().unwrap().take();
-        if let Some((mut handle, initial)) = entry {
-            let rx = handle.take_output();
-            if !initial.is_empty() {
-                self.append_output(&initial);
+        self.status = SlotStatus::Pending;
+        match iced_term::Terminal::new(self.id as u64, self.term_settings.clone()) {
+            Ok(mut term) => {
+                // Register bindings that swallow our Cmd shortcuts so iced_term
+                // doesn't forward the letter to the PTY.
+                term.handle(iced_term::Command::AddBindings(gui_shortcut_bindings()));
+                self.terminal = Some(term);
+                self.status = SlotStatus::Running;
             }
-            self.status = AgentStatus::Ready(std::time::Instant::now());
-            self.session = Some(handle);
-            let slot = self.id;
-
-            Task::stream(iced::stream::channel(
-                32,
-                move |mut sender: futures::channel::mpsc::Sender<Message>| async move {
-                    let (done_tx, done_rx) = futures::channel::oneshot::channel::<()>();
-                    std::thread::spawn(move || {
-                        use futures::sink::SinkExt;
-                        while let Ok(chunk) = rx.recv() {
-                            if futures::executor::block_on(
-                                sender.send(Message::OutputChunk { slot, data: chunk }),
-                            )
-                            .is_err()
-                            {
-                                break;
-                            }
-                        }
-                        let _ = futures::executor::block_on(
-                            sender.send(Message::OutputDone(slot)),
-                        );
-                        let _ = done_tx.send(());
-                    });
-                    let _ = done_rx.await;
-                },
-            ))
-        } else {
-            self.status = AgentStatus::Idle;
-            Task::done(Message::LaunchFailed(self.id))
+            Err(e) => {
+                eprintln!("Failed to launch terminal {}: {e}", self.id);
+                self.status = SlotStatus::Idle;
+            }
         }
     }
 
     pub fn kill(&mut self) {
-        if let Some(ref mut session) = self.session {
-            let _ = session.kill();
+        self.terminal = None;
+        self.status = SlotStatus::Idle;
+    }
+
+    pub fn status_text(&self) -> String {
+        match self.status {
+            SlotStatus::Idle => "Idle".into(),
+            SlotStatus::Pending => "Launching...".into(),
+            SlotStatus::Running => "Running".into(),
         }
-        self.session = None;
-        self.status = AgentStatus::Idle;
     }
 }
 
-// ── Content Range Detection ──────────────────────────────────────────────────
+// ── iTerm Color Palette ──────────────────────────────────────────────────────
 
-fn compute_content_range(text: &str) -> Option<(usize, usize)> {
-    let lines: Vec<&str> = text.lines().collect();
-    if lines.is_empty() {
-        return None;
-    }
-
-    let mut start = 0;
-    for (i, line) in lines.iter().enumerate() {
-        if line.starts_with(CLAUDE_CODE_BANNER_PREFIX)
-            || line.starts_with("│")
-            || line.starts_with("╰")
-        {
-            start = i + 1;
-        } else if !line.trim().is_empty() {
-            break;
-        }
-    }
-
-    let mut end = lines.len();
-    for i in (0..lines.len()).rev() {
-        let line = lines[i].trim();
-        if line.is_empty() {
-            continue;
-        }
-        if line.starts_with(CLAUDE_CODE_STATUS_PREFIX) || detect_status_block(line) {
-            end = i;
-        } else {
-            break;
-        }
-    }
-
-    if start >= end {
-        None
-    } else {
-        Some((start, end))
+fn iterm_color_palette() -> iced_term::ColorPalette {
+    iced_term::ColorPalette {
+        foreground: "#d4d4d4".into(),
+        background: "#1e1e1e".into(),
+        black: "#000000".into(),
+        red: "#cd3131".into(),
+        green: "#0dbc79".into(),
+        yellow: "#e5e510".into(),
+        blue: "#2472c8".into(),
+        magenta: "#bc3fbc".into(),
+        cyan: "#11a8cd".into(),
+        white: "#e5e5e5".into(),
+        bright_black: "#666666".into(),
+        bright_red: "#f14c4c".into(),
+        bright_green: "#23d18b".into(),
+        bright_yellow: "#f5f543".into(),
+        bright_blue: "#3b8eea".into(),
+        bright_magenta: "#d670d6".into(),
+        bright_cyan: "#29b8db".into(),
+        bright_white: "#e5e5e5".into(),
+        bright_foreground: None,
+        dim_foreground: "#828482".into(),
+        dim_black: "#0f0f0f".into(),
+        dim_red: "#712b2b".into(),
+        dim_green: "#5f6f3a".into(),
+        dim_yellow: "#a17e4d".into(),
+        dim_blue: "#456877".into(),
+        dim_magenta: "#704d68".into(),
+        dim_cyan: "#4d7770".into(),
+        dim_white: "#8e8e8e".into(),
     }
 }
 
-fn detect_status_block(line: &str) -> bool {
-    (line.contains("Auto") || line.contains("Plan") || line.contains("Bash"))
-        && (line.contains("$") || line.contains("tokens") || line.contains("cost"))
-}
+// ── GUI Shortcut Bindings ─────────────────────────────────────────────────
+// These bindings prevent Cmd+letter shortcuts from being forwarded to the PTY
+// by iced_term. BindingAction::LinkOpen is a no-op in iced_term's keyboard
+// handler (falls to `_ => {}`).
 
-fn compute_display_text(screen: &vt100::Screen, start: usize, end: usize) -> String {
-    let full = screen.contents();
-    let lines: Vec<&str> = full.lines().collect();
-    let slice = &lines[start..end.min(lines.len())];
+fn gui_shortcut_bindings() -> Vec<(Binding<InputKind>, BindingAction)> {
+    use iced::keyboard::Modifiers;
 
-    let mut result = slice.join("\n");
+    let cmd = Modifiers::COMMAND;
+    let cmd_shift = Modifiers::COMMAND | Modifiers::SHIFT;
 
-    let (cursor_row, cursor_col) = (
-        screen.cursor_position().0 as usize,
-        screen.cursor_position().1 as usize,
-    );
+    let swallow = |key: &str, mods: Modifiers| -> (Binding<InputKind>, BindingAction) {
+        (
+            Binding {
+                target: InputKind::Char(key.to_string()),
+                modifiers: mods,
+                terminal_mode_include: iced_term::TermMode::empty(),
+                terminal_mode_exclude: iced_term::TermMode::empty(),
+            },
+            BindingAction::LinkOpen,
+        )
+    };
 
-    if cursor_row >= start && cursor_row < end {
-        let adjusted_row = cursor_row - start;
-        let mut display_lines: Vec<String> = result.lines().map(|l| l.to_string()).collect();
-        if adjusted_row < display_lines.len() {
-            let line = &mut display_lines[adjusted_row];
-            while line.len() < cursor_col {
-                line.push(' ');
-            }
-            if cursor_col < line.len() {
-                let mut chars: Vec<char> = line.chars().collect();
-                if cursor_col < chars.len() {
-                    chars[cursor_col] = '▋';
-                }
-                *line = chars.into_iter().collect();
-            } else {
-                line.push('▋');
-            }
-        }
-        result = display_lines.join("\n");
-    }
-
-    result
-}
-
-// ── Keyboard → Terminal Sequence ─────────────────────────────────────────────
-
-/// Translate an Iced keyboard event into terminal byte sequence(s).
-fn key_to_terminal_seq(
-    key: &keyboard::Key,
-    modifiers: keyboard::Modifiers,
-    text: Option<&str>,
-) -> Option<String> {
-    use keyboard::key::Named;
-
-    // Never forward Cmd combos — those belong to the GUI / OS.
-    if modifiers.command() {
-        return None;
-    }
-
-    // Ctrl+letter → control byte (0x01–0x1A).
-    if modifiers.control() {
-        if let keyboard::Key::Character(c) = key {
-            let ch = c.chars().next()?;
-            if ch.is_ascii_lowercase() {
-                let byte = (ch as u8) - b'a' + 1;
-                return Some(String::from(byte as char));
-            }
-        }
-        if let keyboard::Key::Named(Named::Space) = key {
-            return Some(String::from('\0'));
-        }
-    }
-
-    // Named keys → ANSI escape sequences or single bytes.
-    if let keyboard::Key::Named(named) = key {
-        // Modifier-only keys produce no terminal output.
-        match named {
-            Named::Shift | Named::Control | Named::Alt | Named::Super
-            | Named::CapsLock | Named::NumLock | Named::ScrollLock | Named::Fn
-            | Named::Meta => return None,
-            _ => {}
-        }
-
-        let seq: Option<&str> = match named {
-            Named::Space => Some(" "),
-            Named::Enter => Some("\r"),
-            Named::Backspace => Some("\x7f"),
-            Named::Tab if modifiers.shift() => Some("\x1b[Z"),
-            Named::Tab => Some("\t"),
-            Named::Escape => Some("\x1b"),
-            Named::Insert => Some("\x1b[2~"),
-            Named::Delete => Some("\x1b[3~"),
-            Named::ArrowUp => Some("\x1b[A"),
-            Named::ArrowDown => Some("\x1b[B"),
-            Named::ArrowRight => Some("\x1b[C"),
-            Named::ArrowLeft => Some("\x1b[D"),
-            Named::Home => Some("\x1b[H"),
-            Named::End => Some("\x1b[F"),
-            Named::PageUp => Some("\x1b[5~"),
-            Named::PageDown => Some("\x1b[6~"),
-            Named::F1 => Some("\x1bOP"),
-            Named::F2 => Some("\x1bOQ"),
-            Named::F3 => Some("\x1bOR"),
-            Named::F4 => Some("\x1bOS"),
-            Named::F5 => Some("\x1b[15~"),
-            Named::F6 => Some("\x1b[17~"),
-            Named::F7 => Some("\x1b[18~"),
-            Named::F8 => Some("\x1b[19~"),
-            Named::F9 => Some("\x1b[20~"),
-            Named::F10 => Some("\x1b[21~"),
-            Named::F11 => Some("\x1b[23~"),
-            Named::F12 => Some("\x1b[24~"),
-            _ => None,
-        };
-        if let Some(s) = seq {
-            return Some(s.into());
-        }
-    }
-
-    // Printable characters — use the `text` field from winit.
-    if let Some(t) = text {
-        if !t.is_empty() {
-            return if modifiers.alt() {
-                Some(format!("\x1b{t}"))
-            } else {
-                Some(t.to_owned())
-            };
-        }
-    }
-
-    None
-}
-
-fn ctrl_split_point(bytes: &[u8]) -> usize {
-    let mut split = bytes.len();
-    for i in (0..bytes.len()).rev() {
-        if bytes[i] >= 0x20 || bytes[i] == b'\t' {
-            split = i + 1;
-            break;
-        }
-    }
-    split
+    vec![
+        swallow("d", cmd),       // Cmd+D → toggle split
+        swallow("d", cmd_shift), // Cmd+Shift+D → split vertical
+        swallow("b", cmd),       // Cmd+B → toggle sidebar
+        swallow("t", cmd),       // Cmd+T → new tab
+        swallow("w", cmd),       // Cmd+W → close pane
+        swallow("q", cmd),       // Cmd+Q → quit
+        // Cmd+1-9 → select tab
+        swallow("1", cmd),
+        swallow("2", cmd),
+        swallow("3", cmd),
+        swallow("4", cmd),
+        swallow("5", cmd),
+        swallow("6", cmd),
+        swallow("7", cmd),
+        swallow("8", cmd),
+        swallow("9", cmd),
+    ]
 }
 
 // ── State ────────────────────────────────────────────────────────────────────
 
 pub struct State {
-    slots: Vec<AgentSlot>,
-    active_tab: usize,
-    split_active: bool,
-    split_secondary: usize,
-    base_cmd: Vec<String>,
-    next_slot_id: usize,
-
-    // Asset handles
-    kill_handle: iced::widget::image::Handle,
-    filtered_handle: iced::widget::image::Handle,
-    raw_handle: iced::widget::image::Handle,
-
-    // Test harness
-    test_state: Arc<Mutex<crate::test_harness::TestState>>,
+    pub slots: Vec<AgentSlot>,
+    pub panes: pane_grid::State<usize>, // each pane stores a slot index
+    pub focus: Option<pane_grid::Pane>,
+    pub sidebar_visible: bool,
+    pub base_cmd: Vec<String>,
+    pub next_slot_id: usize,
+    pub test_state: Arc<Mutex<crate::test_harness::TestState>>,
+    pub config: crate::config::AppConfig,
+    #[cfg(target_os = "macos")]
+    vibrancy_applied: bool,
 }
 
 impl State {
     pub fn new(cmd: Vec<String>) -> Self {
-        let slot = AgentSlot::new(0, cmd.clone(), "Tab 1".to_string());
+        // Load config (creates default if needed)
+        crate::config::ensure_default_config();
+        let config = crate::config::load().unwrap_or_default();
+
+        let slot = AgentSlot::new(0, cmd.clone(), "Agent 1".into(), &config);
+        let (panes, first_pane) = pane_grid::State::new(0_usize); // pane 0 → slot 0
 
         let test_state = Arc::new(Mutex::new(crate::test_harness::TestState {
             slots: vec![crate::test_harness::SlotState::default()],
+            active_tab: 0,
+            split_active: false,
+            split_secondary: 0,
             death_cries_enabled: false,
         }));
 
         Self {
             slots: vec![slot],
-            active_tab: 0,
-            split_active: false,
-            split_secondary: 0,
+            panes,
+            focus: Some(first_pane),
+            sidebar_visible: true,
             base_cmd: cmd,
             next_slot_id: 1,
-            kill_handle: iced::widget::image::Handle::from_bytes(
-                include_bytes!("../assets/icon_kill.png").to_vec(),
-            ),
-            filtered_handle: iced::widget::image::Handle::from_bytes(
-                include_bytes!("../assets/icon_filtered.png").to_vec(),
-            ),
-            raw_handle: iced::widget::image::Handle::from_bytes(
-                include_bytes!("../assets/icon_raw.png").to_vec(),
-            ),
             test_state,
+            config,
+            #[cfg(target_os = "macos")]
+            vibrancy_applied: false,
         }
     }
 
-    fn active_slot(&self) -> Option<usize> {
-        if self.active_tab < self.slots.len() {
-            Some(self.active_tab)
-        } else {
-            None
-        }
+    /// The slot index of the focused pane, if any.
+    pub fn active_slot_idx(&self) -> Option<usize> {
+        self.focus.and_then(|p| self.panes.get(p).copied())
+    }
+
+    /// Check if a slot index is currently visible in any pane.
+    fn slot_in_pane(&self, slot_idx: usize) -> Option<pane_grid::Pane> {
+        self.panes.iter().find_map(|(pane, &idx)| {
+            if idx == slot_idx { Some(*pane) } else { None }
+        })
     }
 
     fn sync_test_state(&self) {
         let mut ts = self.test_state.lock().unwrap();
-        ts.slots.resize_with(self.slots.len(), Default::default);
+        ts.active_tab = self.active_slot_idx().unwrap_or(0);
+        ts.split_active = self.panes.len() > 1;
+
+        // For backward compat, find the "secondary" pane's slot
+        if self.panes.len() > 1 {
+            if let Some(focus) = self.focus {
+                // secondary = first pane that isn't the focused one
+                ts.split_secondary = self.panes.iter()
+                    .find(|(p, _)| **p != focus)
+                    .map(|(_, &idx)| idx)
+                    .unwrap_or(0);
+            }
+        } else {
+            ts.split_secondary = 0;
+        }
+
+        // Sync slot statuses
+        while ts.slots.len() < self.slots.len() {
+            ts.slots.push(crate::test_harness::SlotState::default());
+        }
+        ts.slots.truncate(self.slots.len());
+
         for (i, slot) in self.slots.iter().enumerate() {
-            ts.slots[i] = crate::test_harness::SlotState {
-                id: slot.id,
-                status: match &slot.status {
-                    AgentStatus::Idle => "idle".into(),
-                    AgentStatus::Pending => "pending".into(),
-                    AgentStatus::Ready(_) => "ready".into(),
-                },
-                output_bytes: slot.output_log.len(),
-                content: slot.content_text(),
+            ts.slots[i].status = match slot.status {
+                SlotStatus::Idle => "idle".into(),
+                SlotStatus::Pending => "pending".into(),
+                SlotStatus::Running => "ready".into(),
             };
         }
     }
 
+    // ── Update ───────────────────────────────────────────────────────────────
+
     pub fn update(&mut self, message: Message) -> Task<Message> {
-        // Bounds-check slot indices
-        let slot_idx = match &message {
-            Message::Launch(s)
-            | Message::SessionSpawned(s)
-            | Message::LaunchFailed(s)
-            | Message::Kill(s)
-            | Message::OutputDone(s)
-            | Message::ToggleView(s)
-            | Message::CloseTab(s) => Some(*s),
-            Message::OutputChunk { slot, .. } => Some(*slot),
-            Message::SendInput(s, _) => Some(*s),
-            Message::SelectTab(_)
-            | Message::NewTab
-            | Message::SwitchTab(_)
-            | Message::ToggleSplit
-            | Message::PtyKeystroke(_)
-            | Message::PtyPaste
-            | Message::PtyPasteResult(_)
-            | Message::KeyboardIgnored
-            | Message::Quit => None,
-        };
-        if let Some(idx) = slot_idx {
-            if idx >= self.slots.len() {
-                return Task::none();
-            }
+        // Apply vibrancy on first update (window now exists, we're on main thread)
+        // DISABLED: vibrancy applies to entire content view, making terminal grey.
+        // Needs per-subview vibrancy (sidebar only) — Phase 2 task.
+        #[cfg(target_os = "macos")]
+        if !self.vibrancy_applied {
+            self.vibrancy_applied = true;
+            // if objc2::MainThreadMarker::new().is_some() {
+            //     apply_macos_vibrancy();
+            // }
         }
 
         let task = match message {
-            Message::Launch(slot) => self.slots[slot].launch(),
-            Message::SessionSpawned(slot) => self.slots[slot].session_spawned(),
-            Message::LaunchFailed(slot) => {
-                self.slots[slot].status = AgentStatus::Idle;
-                Task::none()
-            }
-            Message::Kill(slot) => {
-                self.slots[slot].kill();
-                Task::none()
-            }
-            Message::OutputChunk { slot, data } => {
-                self.slots[slot].append_output(&data);
-                Task::none()
-            }
-            Message::OutputDone(slot) => {
-                self.slots[slot].session = None;
-                self.slots[slot].status = AgentStatus::Idle;
-                Task::none()
-            }
-            Message::PtyPaste => clipboard::read().map(Message::PtyPasteResult),
-            Message::PtyPasteResult(result) => {
-                let Some(slot) = self.active_slot() else {
-                    return Task::none();
-                };
-                if self.slots[slot].session.is_none() {
-                    return Task::none();
-                }
-                let bracketed = self.slots[slot].vt_parser.screen().bracketed_paste();
-                match result {
-                    Some(text) if bracketed => {
-                        let payload =
-                            format!("{BRACKETED_PASTE_START}{text}{BRACKETED_PASTE_END}");
-                        Task::done(Message::SendInput(slot, payload))
+            Message::LaunchSlot(idx) => {
+                if idx < self.slots.len() && self.slots[idx].status == SlotStatus::Idle {
+                    self.slots[idx].launch();
+                    if let Some(ref term) = self.slots[idx].terminal {
+                        return TerminalView::focus(term.widget_id().clone());
                     }
-                    Some(text) => Task::done(Message::SendInput(slot, text)),
-                    None if bracketed => {
-                        let payload =
-                            format!("{BRACKETED_PASTE_START}{BRACKETED_PASTE_END}");
-                        Task::done(Message::SendInput(slot, payload))
-                    }
-                    None => Task::none(),
-                }
-            }
-            Message::SendInput(slot, data) => {
-                self.slots[slot].log_input(data.as_bytes());
-                if let Some(ref session) = self.slots[slot].session {
-                    let bytes = data.as_bytes();
-                    let split = ctrl_split_point(bytes);
-                    if split > 0 && split < bytes.len() {
-                        let _ = session.send(&bytes[..split]);
-                        let tail = String::from_utf8_lossy(&bytes[split..]).into_owned();
-                        return Task::done(Message::SendInput(slot, tail));
-                    }
-                    let _ = session.send(bytes);
                 }
                 Task::none()
             }
+
+            Message::KillSlot(idx) => {
+                if idx < self.slots.len() {
+                    self.slots[idx].kill();
+                }
+                Task::none()
+            }
+
+            Message::SendInput(idx, data) => {
+                if let Some(slot) = self.slots.get_mut(idx) {
+                    if let Some(ref mut terminal) = slot.terminal {
+                        let cmd = iced_term::Command::ProxyToBackend(
+                            iced_term::backend::Command::Write(data.into_bytes()),
+                        );
+                        terminal.handle(cmd);
+                    }
+                }
+                Task::none()
+            }
+
             Message::SelectTab(idx) => {
                 if idx < self.slots.len() {
-                    self.active_tab = idx;
-                    if self.slots[idx].status == AgentStatus::Idle {
-                        self.slots[idx].launch()
-                    } else {
-                        Task::none()
+                    // If this slot is already in a pane, focus that pane
+                    if let Some(pane) = self.slot_in_pane(idx) {
+                        self.focus = Some(pane);
+                    } else if let Some(focused) = self.focus {
+                        // Otherwise, update the focused pane to show this slot
+                        if let Some(slot_ref) = self.panes.get_mut(focused) {
+                            *slot_ref = idx;
+                        }
                     }
-                } else {
-                    Task::none()
+                    // Focus the terminal widget
+                    if let Some(ref term) = self.slots[idx].terminal {
+                        self.sync_test_state();
+                        return TerminalView::focus(term.widget_id().clone());
+                    }
                 }
+                Task::none()
             }
+
             Message::NewTab => {
                 let id = self.next_slot_id;
                 self.next_slot_id += 1;
-                let label = format!("Tab {}", id + 1);
-                let mut slot = AgentSlot::new(id, self.base_cmd.clone(), label);
-                let task = slot.launch();
+                let label = format!("Agent {}", id + 1);
+                let slot = AgentSlot::new(id, self.base_cmd.clone(), label, &self.config);
                 self.slots.push(slot);
-                self.active_tab = self.slots.len() - 1;
+
+                // Update focused pane to show the new slot
+                let new_idx = self.slots.len() - 1;
+                if let Some(focused) = self.focus {
+                    if let Some(slot_ref) = self.panes.get_mut(focused) {
+                        *slot_ref = new_idx;
+                    }
+                }
 
                 let mut ts = self.test_state.lock().unwrap();
                 ts.slots.push(crate::test_harness::SlotState::default());
                 drop(ts);
 
-                task
+                Task::none()
             }
+
             Message::CloseTab(idx) => {
                 if self.slots.len() <= 1 {
                     return Task::none();
                 }
                 self.slots[idx].kill();
                 self.slots.remove(idx);
-                if self.active_tab >= self.slots.len() {
-                    self.active_tab = self.slots.len() - 1;
+
+                // Update all pane references: any pane pointing to idx or above
+                // needs adjustment
+                let pane_updates: Vec<(pane_grid::Pane, usize)> = self.panes.iter()
+                    .map(|(pane, &slot_idx)| {
+                        let new_idx = if slot_idx == idx {
+                            // This pane pointed to the removed slot — clamp
+                            idx.min(self.slots.len() - 1)
+                        } else if slot_idx > idx {
+                            slot_idx - 1
+                        } else {
+                            slot_idx
+                        };
+                        (*pane, new_idx)
+                    })
+                    .collect();
+
+                for (pane, new_idx) in pane_updates {
+                    if let Some(slot_ref) = self.panes.get_mut(pane) {
+                        *slot_ref = new_idx;
+                    }
                 }
-                if self.split_secondary >= self.slots.len() {
-                    self.split_secondary = self.slots.len().saturating_sub(1);
-                }
+
                 Task::none()
             }
+
             Message::SwitchTab(delta) => {
+                // If multiple panes, cycle focus between panes
+                if self.panes.len() > 1 {
+                    if let Some(focused) = self.focus {
+                        // Try primary direction, then fallback to opposite for wrap
+                        let (primary, fallback) = if delta > 0 {
+                            (pane_grid::Direction::Right, pane_grid::Direction::Left)
+                        } else {
+                            (pane_grid::Direction::Left, pane_grid::Direction::Right)
+                        };
+                        let adjacent = self.panes.adjacent(focused, primary)
+                            .or_else(|| self.panes.adjacent(focused, fallback));
+                        if let Some(adj) = adjacent {
+                            self.focus = Some(adj);
+                            if let Some(&slot_idx) = self.panes.get(adj) {
+                                if slot_idx < self.slots.len() {
+                                    if let Some(ref term) = self.slots[slot_idx].terminal {
+                                        self.sync_test_state();
+                                        return TerminalView::focus(term.widget_id().clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return Task::none();
+                }
+                // Single pane — cycle the slot shown in it
                 let len = self.slots.len() as i32;
                 if len == 0 {
                     return Task::none();
                 }
-                let current = self.active_tab as i32;
+                let current = self.active_slot_idx().unwrap_or(0) as i32;
                 let new_idx = (current + delta).rem_euclid(len) as usize;
-                self.active_tab = new_idx;
+                if let Some(focused) = self.focus {
+                    if let Some(slot_ref) = self.panes.get_mut(focused) {
+                        *slot_ref = new_idx;
+                    }
+                }
+                if let Some(ref term) = self.slots[new_idx].terminal {
+                    self.sync_test_state();
+                    return TerminalView::focus(term.widget_id().clone());
+                }
                 Task::none()
             }
-            Message::ToggleView(slot) => {
-                let s = &mut self.slots[slot];
-                s.output_view = match s.output_view {
-                    OutputView::Filtered => {
-                        s.load_raw_log();
-                        OutputView::Raw
+
+            Message::SplitFocused(axis) => {
+                if let Some(focused) = self.focus {
+                    // Create a new slot for the new pane
+                    let id = self.next_slot_id;
+                    self.next_slot_id += 1;
+                    let label = format!("Agent {}", id + 1);
+                    let slot = AgentSlot::new(id, self.base_cmd.clone(), label, &self.config);
+                    self.slots.push(slot);
+                    let new_idx = self.slots.len() - 1;
+
+                    let mut ts = self.test_state.lock().unwrap();
+                    ts.slots.push(crate::test_harness::SlotState::default());
+                    drop(ts);
+
+                    if let Some((new_pane, _)) = self.panes.split(axis, focused, new_idx) {
+                        self.focus = Some(new_pane);
                     }
-                    OutputView::Raw => {
-                        s.raw_log_cache.clear();
-                        OutputView::Filtered
-                    }
-                };
+                }
                 Task::none()
             }
+
             Message::ToggleSplit => {
-                self.split_active = !self.split_active;
-                if self.split_active && self.slots.len() > 1 {
-                    self.split_secondary = if self.active_tab == 0 { 1 } else { 0 };
+                if self.panes.len() > 1 {
+                    // Close all panes except focused
+                    while self.panes.len() > 1 {
+                        // Find a pane that isn't focused
+                        let to_close = self.panes.iter()
+                            .find(|(p, _)| Some(**p) != self.focus)
+                            .map(|(p, _)| *p);
+                        if let Some(pane) = to_close {
+                            if let Some((_, sibling)) = self.panes.close(pane) {
+                                self.focus = Some(sibling);
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    // Focus the remaining pane's terminal
+                    if let Some(&slot_idx) = self.focus.and_then(|f| self.panes.get(f)) {
+                        if slot_idx < self.slots.len() {
+                            if let Some(ref term) = self.slots[slot_idx].terminal {
+                                self.sync_test_state();
+                                return TerminalView::focus(term.widget_id().clone());
+                            }
+                        }
+                    }
+                } else if let Some(focused) = self.focus {
+                    // Only 1 pane → split vertically with a second slot
+                    let secondary = if self.slots.len() > 1 {
+                        // Pick the first slot not currently shown
+                        let current = self.active_slot_idx().unwrap_or(0);
+                        (0..self.slots.len())
+                            .find(|&i| i != current)
+                            .unwrap_or(0)
+                    } else {
+                        // Create a new slot
+                        let id = self.next_slot_id;
+                        self.next_slot_id += 1;
+                        let label = format!("Agent {}", id + 1);
+                        let slot = AgentSlot::new(id, self.base_cmd.clone(), label, &self.config);                        self.slots.push(slot);
+                        let mut ts = self.test_state.lock().unwrap();
+                        ts.slots.push(crate::test_harness::SlotState::default());
+                        drop(ts);
+                        self.slots.len() - 1
+                    };
+                    if let Some((new_pane, _)) = self.panes.split(
+                        pane_grid::Axis::Vertical,
+                        focused,
+                        secondary,
+                    ) {
+                        self.focus = Some(new_pane);
+                        if let Some(ref term) = self.slots[secondary].terminal {
+                            self.sync_test_state();
+                            return TerminalView::focus(term.widget_id().clone());
+                        }
+                    }
                 }
                 Task::none()
             }
-            Message::PtyKeystroke(seq) => {
-                if let Some(slot) = self.active_slot() {
-                    if self.slots[slot].session.is_some() {
-                        Task::done(Message::SendInput(slot, seq))
-                    } else {
-                        Task::none()
+
+            Message::ClosePane => {
+                if let Some(focused) = self.focus {
+                    if self.panes.len() > 1 {
+                        if let Some((_, sibling)) = self.panes.close(focused) {
+                            self.focus = Some(sibling);
+                            if let Some(&slot_idx) = self.panes.get(sibling) {
+                                if slot_idx < self.slots.len() {
+                                    if let Some(ref term) = self.slots[slot_idx].terminal {
+                                        self.sync_test_state();
+                                        return TerminalView::focus(term.widget_id().clone());
+                                    }
+                                }
+                            }
+                        }
                     }
-                } else {
-                    Task::none()
                 }
+                Task::none()
             }
+
+            Message::PaneClicked(pane) => {
+                self.focus = Some(pane);
+                if let Some(&slot_idx) = self.panes.get(pane) {
+                    if slot_idx < self.slots.len() {
+                        // If terminal is running, focus it
+                        if let Some(ref term) = self.slots[slot_idx].terminal {
+                            self.sync_test_state();
+                            return TerminalView::focus(term.widget_id().clone());
+                        }
+                        // If idle, launch it
+                        if self.slots[slot_idx].status == SlotStatus::Idle {
+                            self.slots[slot_idx].launch();
+                            if let Some(ref term) = self.slots[slot_idx].terminal {
+                                self.sync_test_state();
+                                return TerminalView::focus(term.widget_id().clone());
+                            }
+                        }
+                    }
+                }
+                Task::none()
+            }
+
+            Message::PaneResized(pane_grid::ResizeEvent { split, ratio }) => {
+                self.panes.resize(split, ratio);
+                Task::none()
+            }
+
+            Message::PaneDragged(pane_grid::DragEvent::Dropped { pane, target }) => {
+                self.panes.drop(pane, target);
+                Task::none()
+            }
+
+            Message::PaneDragged(_) => Task::none(),
+
+            Message::TermEvent(iced_term::Event::BackendCall(id, ref cmd)) => {
+                if let Some(slot) = self.slots.iter_mut().find(|s| s.id as u64 == id) {
+                    if let Some(ref mut term) = slot.terminal {
+                        let action = term.handle(iced_term::Command::ProxyToBackend(cmd.clone()));
+                        if action == iced_term::actions::Action::Shutdown {
+                            slot.terminal = None;
+                            slot.status = SlotStatus::Idle;
+                        }
+                    }
+                }
+                Task::none()
+            }
+
+            Message::ToggleSidebar => {
+                self.sidebar_visible = !self.sidebar_visible;
+                // Re-focus current terminal
+                if let Some(slot_idx) = self.active_slot_idx() {
+                    if slot_idx < self.slots.len() {
+                        if let Some(ref term) = self.slots[slot_idx].terminal {
+                            self.sync_test_state();
+                            return TerminalView::focus(term.widget_id().clone());
+                        }
+                    }
+                }
+                Task::none()
+            }
+
+            Message::ConfigReloaded(new_config) => {
+                eprintln!("[config] reloaded: {} golems, {} groups",
+                    new_config.golem.len(), new_config.groups.len());
+                self.config = new_config;
+                Task::none()
+            }
+
             Message::KeyboardIgnored => return Task::none(),
+
             Message::Quit => {
                 for slot in &mut self.slots {
                     slot.kill();
@@ -747,10 +664,21 @@ impl State {
         task
     }
 
+    // ── Subscription ─────────────────────────────────────────────────────────
+
     pub fn subscription(&self) -> Subscription<Message> {
-        keyboard::listen().map(|event| match event {
-            // ── GUI shortcuts (Cmd-based) ─────────────────────────────
-            // Cmd+Alt+Arrow → switch tabs
+        let mut subscriptions: Vec<Subscription<Message>> = vec![];
+
+        // Terminal subscriptions (iced_term handles keyboard input internally)
+        for slot in &self.slots {
+            if let Some(ref term) = slot.terminal {
+                subscriptions.push(term.subscription().map(Message::TermEvent));
+            }
+        }
+
+        // GUI shortcuts (Cmd-based, not forwarded to terminal)
+        subscriptions.push(keyboard::listen().map(|event| match event {
+            // Cmd+Alt+Left/Right → SwitchTab (cycles panes or tabs)
             keyboard::Event::KeyPressed {
                 key, modifiers, ..
             } if modifiers.command() && modifiers.alt() => match key {
@@ -760,26 +688,48 @@ impl State {
                 keyboard::Key::Named(keyboard::key::Named::ArrowRight) => {
                     Message::SwitchTab(1)
                 }
+                keyboard::Key::Named(keyboard::key::Named::ArrowUp) => {
+                    Message::SwitchTab(-1)
+                }
+                keyboard::Key::Named(keyboard::key::Named::ArrowDown) => {
+                    Message::SwitchTab(1)
+                }
                 _ => Message::KeyboardIgnored,
             },
+            // Cmd+Shift+D → split vertical
+            keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character(ref c),
+                modifiers,
+                ..
+            } if c.as_ref() == "d" && modifiers.command() && modifiers.shift() => {
+                Message::SplitFocused(pane_grid::Axis::Vertical)
+            }
             // Cmd+T → new tab
             keyboard::Event::KeyPressed {
                 key: keyboard::Key::Character(ref c),
                 modifiers,
                 ..
             } if c.as_ref() == "t" && modifiers.command() => Message::NewTab,
-            // Cmd+V → paste
+            // Cmd+D → toggle split (1 pane ↔ 2 panes side-by-side)
             keyboard::Event::KeyPressed {
                 key: keyboard::Key::Character(ref c),
                 modifiers,
                 ..
-            } if c.as_ref() == "v" && modifiers.command() => Message::PtyPaste,
-            // Cmd+D → toggle split
+            } if c.as_ref() == "d" && modifiers.command() => {
+                Message::ToggleSplit
+            }
+            // Cmd+W → close pane
             keyboard::Event::KeyPressed {
                 key: keyboard::Key::Character(ref c),
                 modifiers,
                 ..
-            } if c.as_ref() == "d" && modifiers.command() => Message::ToggleSplit,
+            } if c.as_ref() == "w" && modifiers.command() => Message::ClosePane,
+            // Cmd+B → toggle sidebar
+            keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character(ref c),
+                modifiers,
+                ..
+            } if c.as_ref() == "b" && modifiers.command() => Message::ToggleSidebar,
             // Cmd+Q → quit
             keyboard::Event::KeyPressed {
                 key: keyboard::Key::Character(ref c),
@@ -802,439 +752,399 @@ impl State {
                     Message::KeyboardIgnored
                 }
             }
-            // ── PTY pass-through ──────────────────────────────────────
-            keyboard::Event::KeyPressed {
-                ref key,
-                modifiers,
-                ref text,
-                ..
-            } => {
-                if let Some(seq) = key_to_terminal_seq(key, modifiers, text.as_deref()) {
-                    Message::PtyKeystroke(seq)
-                } else {
-                    Message::KeyboardIgnored
-                }
-            }
             _ => Message::KeyboardIgnored,
-        })
+        }));
+
+        // Config file watcher for hot-reload
+        subscriptions.push(
+            crate::config::watch_config().map(Message::ConfigReloaded),
+        );
+
+        Subscription::batch(subscriptions)
     }
 
+    // ── View ─────────────────────────────────────────────────────────────────
+
     pub fn view(&self) -> iced::Element<'_, Message> {
-        let tab_bar = self.view_tab_bar_strip();
+        let focus = self.focus;
+        let focus_border_color = parse_hex_color(&self.config.ui.colors.focus_border);
+        let pane_spacing = self.config.ui.pane_spacing;
 
-        if self.split_active && self.slots.len() > 1 {
-            let left_idx = self.active_tab;
-            let right_idx = self.split_secondary;
+        let pane_grid_widget = PaneGrid::new(&self.panes, |pane_id, &slot_idx, _is_maximized| {
+            let is_focused = focus == Some(pane_id);
+            let content = self.view_pane_content(slot_idx, is_focused);
 
-            let left_panel = self.view_terminal_panel(left_idx, true);
-            let right_panel = self.view_terminal_panel(right_idx, false);
+            pane_grid::Content::new(content)
+                .style(move |_theme| {
+                    let border_color = if is_focused {
+                        focus_border_color
+                    } else {
+                        iced::Color::TRANSPARENT
+                    };
+                    container::Style {
+                        border: iced::Border {
+                            color: border_color,
+                            width: if is_focused { 2.0 } else { 0.0 },
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }
+                })
+        })
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .spacing(pane_spacing)
+        .on_click(Message::PaneClicked)
+        .on_drag(Message::PaneDragged)
+        .on_resize(PANE_RESIZE_GRAB_AREA, Message::PaneResized);
 
-            let split = row![left_panel, rule::vertical(RULE_THICKNESS), right_panel]
-                .width(Length::Fill)
-                .height(Length::Fill);
+        let content_area: iced::Element<'_, Message> = container(pane_grid_widget)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
 
-            column![tab_bar, rule::horizontal(RULE_THICKNESS), split]
+        if self.sidebar_visible {
+            let sidebar = self.view_sidebar();
+            row![sidebar, rule::vertical(RULE_THICKNESS), content_area]
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into()
         } else {
-            let terminal = if let Some(idx) = self.active_slot() {
-                self.view_terminal_panel(idx, true)
-            } else {
-                container(text("No tabs open").color(TEXT_SECONDARY))
+            content_area
+        }
+    }
+
+    // ── Pane Content ─────────────────────────────────────────────────────────
+
+    fn view_pane_content(
+        &self,
+        slot_idx: usize,
+        _is_focused: bool,
+    ) -> iced::Element<'_, Message> {
+        let text_secondary = parse_hex_color(&self.config.ui.colors.text_secondary);
+        let bg_primary = parse_hex_color(&self.config.ui.colors.bg_primary);
+        let font_small = self.config.ui.font.small;
+        let font_tiny = self.config.ui.font.tiny;
+
+        if slot_idx >= self.slots.len() {
+            return container(text("Invalid pane").color(text_secondary))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(iced::Alignment::Center)
+                .align_y(iced::Alignment::Center)
+                .into();
+        }
+
+        let slot = &self.slots[slot_idx];
+
+        let terminal_view: iced::Element<'_, Message> = if let Some(ref term) = slot.terminal {
+            container(
+                TerminalView::show(term).map(Message::TermEvent),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(move |_theme| container::Style {
+                background: Some(iced::Background::Color(bg_primary)),                ..Default::default()
+            })
+            .into()
+        } else {
+            // Idle state — show launch prompt
+            let launch_text = column![
+                text("Terminal idle").size(font_small).color(text_secondary),
+                text("Press Enter or click to launch")
+                    .size(font_tiny)
+                    .color(text_secondary),
+            ]
+            .spacing(SPACING_TIGHT)
+            .align_x(iced::Alignment::Center);
+
+            let launch_area = button(
+                container(launch_text)
                     .width(Length::Fill)
                     .height(Length::Fill)
                     .align_x(iced::Alignment::Center)
-                    .align_y(iced::Alignment::Center)
-                    .into()
-            };
-
-            column![tab_bar, rule::horizontal(RULE_THICKNESS), terminal]
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into()
-        }
-    }
-
-    // ── View Helpers ─────────────────────────────────────────────────────
-
-    fn view_tab_bar_strip(&self) -> iced::Element<'_, Message> {
-        let mut tabs = row![].spacing(SPACING_TIGHT).align_y(iced::Alignment::Center);
-
-        for (i, slot) in self.slots.iter().enumerate() {
-            let is_active = i == self.active_tab;
-
-            let status_indicator = match &slot.status {
-                AgentStatus::Idle => {
-                    text("○").size(FONT_TINY).color(TEXT_SECONDARY)
-                }
-                AgentStatus::Pending => {
-                    text("◌").size(FONT_TINY).color(ACCENT_COLOR)
-                }
-                AgentStatus::Ready(_) => {
-                    text("●")
-                        .size(FONT_TINY)
-                        .color(iced::Color::from_rgb(0.3, 0.8, 0.4))
-                }
-            };
-
-            let tab_label = text(&slot.label).size(FONT_TAB).color(
-                if is_active {
-                    TEXT_TAB_ACTIVE
-                } else {
-                    TEXT_SECONDARY
-                },
-            );
-
-            let close_btn = button(text("×").size(FONT_SMALL).color(TEXT_SECONDARY))
-                .style(|_theme, _status| iced::widget::button::Style {
-                    background: None,
-                    ..Default::default()
-                })
-                .padding([0.0, 4.0])
-                .on_press(Message::CloseTab(i));
-
-            let tab_content = row![status_indicator, tab_label, close_btn]
-                .spacing(SPACING_TIGHT)
-                .align_y(iced::Alignment::Center);
-
-            let bg = if is_active {
-                BG_TAB_ACTIVE
-            } else {
-                BG_TAB_INACTIVE
-            };
-
-            let tab_btn = button(tab_content)
-                .style(move |_theme, status| {
-                    let mut style = iced::widget::button::Style {
-                        background: Some(iced::Background::Color(bg)),
-                        border: iced::Border {
-                            color: if is_active {
-                                ACCENT_COLOR
-                            } else {
-                                iced::Color::TRANSPARENT
-                            },
-                            width: 0.0,
-                            radius: BORDER_RADIUS.into(),
-                        },
-                        text_color: TEXT_PRIMARY,
-                        ..Default::default()
-                    };
-                    if matches!(status, iced::widget::button::Status::Hovered) && !is_active
-                    {
-                        style.background =
-                            Some(iced::Background::Color(BG_TAB_ACTIVE));
-                    }
-                    style
-                })
-                .padding(TAB_PADDING)
-                .on_press(Message::SelectTab(i));
-
-            tabs = tabs.push(tab_btn);
-        }
-
-        // New tab button
-        let new_tab_btn = button(text("+").size(FONT_TAB).color(TEXT_SECONDARY))
-            .style(|_theme, status| {
-                let mut style = iced::widget::button::Style {
-                    background: None,
-                    text_color: TEXT_SECONDARY,
-                    ..Default::default()
-                };
-                if matches!(status, iced::widget::button::Status::Hovered) {
-                    style.background =
-                        Some(iced::Background::Color(BG_TAB_ACTIVE));
-                }
-                style
-            })
-            .padding(TAB_PADDING)
-            .on_press(Message::NewTab);
-
-        tabs = tabs.push(new_tab_btn);
-
-        // Split toggle button
-        let split_label = if self.split_active { "⧉" } else { "◫" };
-        let split_btn = button(text(split_label).size(FONT_TAB).color(TEXT_SECONDARY))
-            .style(|_theme, status| {
-                let mut style = iced::widget::button::Style {
-                    background: None,
-                    text_color: TEXT_SECONDARY,
-                    ..Default::default()
-                };
-                if matches!(status, iced::widget::button::Status::Hovered) {
-                    style.background =
-                        Some(iced::Background::Color(BG_TAB_ACTIVE));
-                }
-                style
-            })
-            .padding(TAB_PADDING)
-            .on_press(Message::ToggleSplit);
-
-        let bar = row![
-            tabs,
-            iced::widget::Space::new().width(Length::Fill),
-            split_btn,
-        ]
-        .align_y(iced::Alignment::Center)
-        .padding([0.0, SPACING_NORMAL]);
-
-        container(bar)
-            .style(|_theme| container::Style {
-                background: Some(iced::Background::Color(BG_SECONDARY)),
-                ..Default::default()
-            })
-            .width(Length::Fill)
-            .height(TAB_BAR_HEIGHT)
-            .into()
-    }
-
-    fn view_terminal_panel<'a>(
-        &'a self,
-        idx: usize,
-        is_primary: bool,
-    ) -> iced::Element<'a, Message> {
-        let slot = &self.slots[idx];
-        let width = if self.split_active {
-            Length::FillPortion(1)
-        } else {
-            Length::Fill
-        };
-
-        let toolbar = self.view_toolbar(idx, slot);
-        let output = self.view_output(slot);
-        let bottom = self.view_bottom_bar(slot);
-
-        let panel = column![
-            toolbar,
-            rule::horizontal(RULE_THICKNESS),
-            output,
-            rule::horizontal(RULE_THICKNESS),
-            bottom,
-        ]
-        .width(width)
-        .height(Length::Fill);
-
-        if self.split_active && !is_primary {
-            mouse_area(panel)
-                .on_press(Message::SelectTab(idx))
-                .into()
-        } else {
-            panel.into()
-        }
-    }
-
-    fn view_toolbar<'a>(
-        &self,
-        idx: usize,
-        slot: &AgentSlot,
-    ) -> iced::Element<'a, Message> {
-        let is_filtered = slot.output_view == OutputView::Filtered;
-
-        let filtered_btn = button(
-            text("Filtered").size(FONT_SMALL).color(if is_filtered {
-                TEXT_TAB_ACTIVE
-            } else {
-                TEXT_SECONDARY
-            }),
-        )
-        .style(move |_theme, _status| iced::widget::button::Style {
-            background: if is_filtered {
-                Some(iced::Background::Color(BG_TAB_ACTIVE))
-            } else {
-                None
-            },
-            border: iced::Border {
-                radius: BORDER_RADIUS.into(),
-                ..Default::default()
-            },
-            ..Default::default()
-        })
-        .padding([2.0, 8.0])
-        .on_press_maybe((!is_filtered).then_some(Message::ToggleView(idx)));
-
-        let raw_btn = button(
-            text("Raw").size(FONT_SMALL).color(if !is_filtered {
-                TEXT_TAB_ACTIVE
-            } else {
-                TEXT_SECONDARY
-            }),
-        )
-        .style(move |_theme, _status| iced::widget::button::Style {
-            background: if !is_filtered {
-                Some(iced::Background::Color(BG_TAB_ACTIVE))
-            } else {
-                None
-            },
-            border: iced::Border {
-                radius: BORDER_RADIUS.into(),
-                ..Default::default()
-            },
-            ..Default::default()
-        })
-        .padding([2.0, 8.0])
-        .on_press_maybe(is_filtered.then_some(Message::ToggleView(idx)));
-
-        let status_label = match &slot.status {
-            AgentStatus::Idle => text("—").size(FONT_SMALL).color(TEXT_SECONDARY),
-            AgentStatus::Pending => {
-                text("Launching…").size(FONT_SMALL).color(ACCENT_COLOR)
-            }
-            AgentStatus::Ready(_) => text("Running")
-                .size(FONT_SMALL)
-                .color(iced::Color::from_rgb(0.3, 0.8, 0.4)),
-        };
-
-        let kill_btn = button(text("✕").size(FONT_SMALL).color(KILL_BUTTON_COLOR))
-            .style(move |_theme, status| {
-                let mut style = iced::widget::button::Style {
-                    background: None,
-                    border: iced::Border {
-                        color: KILL_BUTTON_COLOR,
-                        width: BORDER_WIDTH,
-                        radius: BORDER_RADIUS.into(),
-                    },
-                    ..Default::default()
-                };
-                if matches!(status, iced::widget::button::Status::Hovered) {
-                    style.background = Some(iced::Background::Color(
-                        KILL_BUTTON_COLOR.scale_alpha(HOVER_ALPHA),
-                    ));
-                }
-                if matches!(status, iced::widget::button::Status::Disabled) {
-                    style.border.color =
-                        KILL_BUTTON_COLOR.scale_alpha(DISABLED_ALPHA);
-                }
-                style
-            })
-            .on_press_maybe(
-                matches!(slot.status, AgentStatus::Ready(_))
-                    .then_some(Message::Kill(idx)),
-            );
-
-        let bar = row![
-            filtered_btn,
-            raw_btn,
-            iced::widget::Space::new().width(Length::Fill),
-            status_label,
-            kill_btn,
-        ]
-        .spacing(SPACING_NORMAL)
-        .align_y(iced::Alignment::Center)
-        .padding([SPACING_TIGHT, SPACING_NORMAL]);
-
-        container(bar)
-            .style(|_theme| container::Style {
-                background: Some(iced::Background::Color(BG_SECONDARY)),
-                ..Default::default()
-            })
-            .width(Length::Fill)
-            .into()
-    }
-
-    fn view_output<'a>(&self, slot: &'a AgentSlot) -> iced::Element<'a, Message> {
-        let content: &str = match slot.output_view {
-            OutputView::Filtered => &slot.display_cache,
-            OutputView::Raw => &slot.raw_log_cache,
-        };
-
-        let terminal = scrollable(
-            container(
-                text(content)
-                    .size(FONT_BODY)
-                    .color(TEXT_PRIMARY)
-                    .font(iced::Font::MONOSPACE),
+                    .align_y(iced::Alignment::Center),
             )
-            .style(|_theme| container::Style {
-                background: Some(iced::Background::Color(BG_PRIMARY)),
+            .style(move |_theme, _status| iced::widget::button::Style {
+                background: Some(iced::Background::Color(bg_primary)),
                 ..Default::default()
             })
-            .padding(SPACING_NORMAL)
-            .width(Length::Fill),
-        )
-        .anchor_bottom()
-        .width(Length::Fill)
-        .height(Length::Fill);
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .on_press(Message::LaunchSlot(slot_idx));
 
-        container(terminal)
-            .style(|_theme| container::Style {
-                background: Some(iced::Background::Color(BG_PRIMARY)),
-                ..Default::default()
-            })
+            launch_area.into()
+        };
+
+        let bottom_bar = self.view_bottom_bar(slot);
+
+        column![terminal_view, rule::horizontal(RULE_THICKNESS), bottom_bar]
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
     }
 
-    fn view_bottom_bar<'a>(
-        &self,
-        slot: &'a AgentSlot,
-    ) -> iced::Element<'a, Message> {
-        let status = slot.status_text();
-        let mode = detect_permission_mode(&status);
+    // ── Sidebar ──────────────────────────────────────────────────────────────
 
-        let byte_count = slot.output_log.len();
-        let byte_label = if byte_count < KB {
-            format!("[{byte_count} bytes]")
-        } else if byte_count < MB {
-            format!("[{:.1} KB]", byte_count as f64 / KB as f64)
-        } else {
-            format!("[{:.1} MB]", byte_count as f64 / MB as f64)
-        };
-        let byte_indicator = text(byte_label).size(FONT_TINY).color(TEXT_SECONDARY);
+    fn view_sidebar(&self) -> iced::Element<'_, Message> {
+        let colors = &self.config.ui.colors;
+        let font = &self.config.ui.font;
+        let text_secondary = parse_hex_color(&colors.text_secondary);
+        let text_tab_active = parse_hex_color(&colors.text_tab_active);
+        let status_running = parse_hex_color(&colors.status_running);
+        let status_pending = parse_hex_color(&colors.status_pending);
+        let status_idle = parse_hex_color(&colors.status_idle);
+        let bg_tab_active = parse_hex_color(&colors.bg_tab_active);
+        let bg_tab_hover = parse_hex_color(&colors.bg_tab_hover);
+        let accent_color = parse_hex_color(&colors.accent);
+        let focus_border = parse_hex_color(&colors.focus_border);
+        // Sidebar has alpha < 1.0 so macOS vibrancy shows through
+        let bg_sidebar = parse_hex_color_alpha(&colors.bg_sidebar, 0.7);
+        let sidebar_width = self.config.ui.sidebar_width;
+        let font_group = font.group;
+        let font_tab = font.tab;
+        let font_small = font.small;
 
-        let bar = if let Some(pm) = mode {
-            let badge = container(
-                text(pm.label())
-                    .size(MODE_BADGE_FONT)
-                    .color(MODE_TEXT_COLOR),
-            )
-            .style(move |_theme: &iced::Theme| container::Style {
-                background: Some(iced::Background::Color(pm.color())),
-                border: iced::Border {
-                    radius: MODE_BADGE_RADIUS.into(),
+        let mut sidebar_content = column![].spacing(2.0).padding([SPACING_NORMAL, 0.0]);
+
+        // Group header: "Agents"
+        let group_header = container(
+            text("AGENTS")
+                .size(font_group)
+                .color(text_secondary),
+        )
+        .padding([SPACING_TIGHT, SPACING_NORMAL]);
+        sidebar_content = sidebar_content.push(group_header);
+
+        let active_slot = self.active_slot_idx();
+        // Collect all slot indices currently visible in panes
+        let visible_slots: Vec<usize> = self.panes.iter().map(|(_, idx)| *idx).collect();
+
+        // Tab entries
+        for (i, slot) in self.slots.iter().enumerate() {
+            let is_active = active_slot == Some(i);
+            let is_in_split = !is_active && visible_slots.contains(&i);
+
+            // Status dot
+            let dot_color = match slot.status {
+                SlotStatus::Running => status_running,
+                SlotStatus::Pending => status_pending,
+                SlotStatus::Idle => status_idle,
+            };
+            let dot = text("●").size(STATUS_DOT_SIZE).color(dot_color);
+
+            // Label
+            let label_color = if is_active || is_in_split {
+                text_tab_active
+            } else {
+                text_secondary
+            };
+            let label = text(&slot.label).size(font_tab).color(label_color);
+
+            let tab_row = row![dot, label]
+                .spacing(SPACING_NORMAL)
+                .align_y(iced::Alignment::Center);
+
+            // Background
+            let bg = if is_active {
+                bg_tab_active
+            } else if is_in_split {
+                bg_tab_hover
+            } else {
+                iced::Color::TRANSPARENT
+            };
+
+            // Left accent border for active tab
+            let border_color = if is_active {
+                accent_color
+            } else if is_in_split {
+                focus_border
+            } else {
+                iced::Color::TRANSPARENT
+            };
+
+            let tab_container = container(tab_row)
+                .style(move |_theme| container::Style {
+                    background: Some(iced::Background::Color(bg)),
+                    border: iced::Border {
+                        color: border_color,
+                        width: if is_active || is_in_split {
+                            2.0
+                        } else {
+                            0.0
+                        },
+                        radius: iced::border::radius(0.0).top_right(BORDER_RADIUS).bottom_right(BORDER_RADIUS),
+                    },
                     ..Default::default()
-                },
+                })
+                .padding([SPACING_TIGHT, SPACING_NORMAL])
+                .width(Length::Fill);
+
+            // Middle-click to close, regular click to select
+            let tab_element: iced::Element<'_, Message> = mouse_area(
+                button(tab_container)
+                    .style(|_theme, _status| iced::widget::button::Style {
+                        background: None,
+                        ..Default::default()
+                    })
+                    .padding(0)
+                    .on_press(Message::SelectTab(i)),
+            )
+            .on_middle_press(Message::CloseTab(i))
+            .into();
+
+            sidebar_content = sidebar_content.push(tab_element);
+        }
+
+        // Spacer
+        sidebar_content = sidebar_content.push(Space::new().width(Length::Fill).height(Length::Fill));
+
+        // New tab button at bottom
+        let new_tab_btn = button(
+            row![
+                text("+").size(font_tab).color(text_secondary),
+                text("New Agent").size(font_small).color(text_secondary),
+            ]
+            .spacing(SPACING_NORMAL)
+            .align_y(iced::Alignment::Center),
+        )
+        .style(move |_theme, status| {
+            let mut style = iced::widget::button::Style {
+                background: None,
+                ..Default::default()
+            };
+            if matches!(status, iced::widget::button::Status::Hovered) {
+                style.background = Some(iced::Background::Color(bg_tab_hover));
+            }
+            style
+        })
+        .padding([SPACING_TIGHT, SPACING_NORMAL])
+        .width(Length::Fill)
+        .on_press(Message::NewTab);
+
+        sidebar_content = sidebar_content.push(new_tab_btn);
+
+        container(sidebar_content)
+            .style(move |_theme| container::Style {
+                background: Some(iced::Background::Color(bg_sidebar)),
                 ..Default::default()
             })
-            .padding(MODE_BADGE_PADDING);
+            .width(sidebar_width)
+            .height(Length::Fill)
+            .into()
+    }
 
-            let hint = text("(Shift+Tab)").size(FONT_TINY).color(TEXT_SECONDARY);
+    // ── Bottom Bar ───────────────────────────────────────────────────────────
 
-            row![
-                badge,
-                hint,
-                iced::widget::Space::new().width(Length::Fill),
-                byte_indicator,
-            ]
-            .spacing(SPACING_NORMAL)
-            .align_y(iced::Alignment::Center)
-        } else {
-            let status_text = text(status).size(FONT_TINY).color(TEXT_SECONDARY);
-            row![
-                status_text,
-                iced::widget::Space::new().width(Length::Fill),
-                byte_indicator,
-            ]
-            .spacing(SPACING_NORMAL)
+    fn view_bottom_bar<'a>(&self, slot: &'a AgentSlot) -> iced::Element<'a, Message> {
+        let colors = &self.config.ui.colors;
+        let status_running = parse_hex_color(&colors.status_running);
+        let status_pending = parse_hex_color(&colors.status_pending);
+        let status_idle = parse_hex_color(&colors.status_idle);
+        let text_secondary = parse_hex_color(&colors.text_secondary);
+        let bg_secondary = parse_hex_color(&colors.bg_secondary);
+        let font_tiny = self.config.ui.font.tiny;
+        let bottom_bar_height = self.config.ui.bottom_bar_height;
+
+        let status = slot.status_text();
+
+        let status_dot_color = match slot.status {
+            SlotStatus::Running => status_running,
+            SlotStatus::Pending => status_pending,
+            SlotStatus::Idle => status_idle,
         };
+        let status_dot = text("●").size(STATUS_DOT_SIZE).color(status_dot_color);
+        let status_label = text(status).size(font_tiny).color(text_secondary);
+
+        let bar = row![
+            status_dot,
+            status_label,
+            Space::new().width(Length::Fill),
+        ]
+        .spacing(SPACING_TIGHT)
+        .align_y(iced::Alignment::Center);
 
         container(bar.width(Length::Fill).padding([2.0, SPACING_NORMAL]))
-            .style(|_theme| container::Style {
-                background: Some(iced::Background::Color(BG_SECONDARY)),
+            .style(move |_theme| container::Style {
+                background: Some(iced::Background::Color(bg_secondary)),
                 ..Default::default()
             })
             .width(Length::Fill)
-            .height(BOTTOM_BAR_HEIGHT)
+            .height(bottom_bar_height)
             .into()
+    }
+}
+
+// ── macOS Vibrancy ───────────────────────────────────────────────────────────
+
+#[cfg(target_os = "macos")]
+fn apply_macos_vibrancy() {
+    use objc2::rc::Retained;
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSApplication;
+    use std::ptr::NonNull;
+
+    // This must be called from the main thread (Iced's update runs on main)
+    let mtm = MainThreadMarker::new()
+        .expect("apply_macos_vibrancy must be called from main thread");
+
+    let app = NSApplication::sharedApplication(mtm);
+    let Some(window) = (unsafe { app.keyWindow() }) else {
+        eprintln!("[vibrancy] no key window found");
+        return;
+    };
+
+    let Some(content_view) = (unsafe { window.contentView() }) else {
+        eprintln!("[vibrancy] no content view");
+        return;
+    };
+
+    // Wrap the NSView pointer for window-vibrancy
+    let ns_view_ptr = Retained::as_ptr(&content_view) as *mut std::ffi::c_void;
+
+    struct NsViewHandle(NonNull<std::ffi::c_void>);
+
+    impl iced::window::raw_window_handle::HasWindowHandle for NsViewHandle {
+        fn window_handle(
+            &self,
+        ) -> Result<iced::window::raw_window_handle::WindowHandle<'_>, iced::window::raw_window_handle::HandleError> {
+            let handle = iced::window::raw_window_handle::AppKitWindowHandle::new(self.0);
+            Ok(unsafe { iced::window::raw_window_handle::WindowHandle::borrow_raw(handle.into()) })
+        }
+    }
+
+    if let Some(ptr) = NonNull::new(ns_view_ptr) {
+        let handle = NsViewHandle(ptr);
+        match window_vibrancy::apply_vibrancy(
+            &handle,
+            window_vibrancy::NSVisualEffectMaterial::Sidebar,
+            Some(window_vibrancy::NSVisualEffectState::Active),
+            None,
+        ) {
+            Ok(()) => eprintln!("[vibrancy] applied Sidebar material"),
+            Err(e) => eprintln!("[vibrancy] failed: {e}"),
+        }
     }
 }
 
 // ── Run ──────────────────────────────────────────────────────────────────────
 
 pub fn run(cmd: Vec<String>) -> anyhow::Result<()> {
+    // Remove CLAUDECODE env var so child terminals can launch Claude Code
+    // (otherwise they think they're nested inside a Claude Code session)
+    std::env::remove_var("CLAUDECODE");
+
     let icon = load_window_icon();
     let mut win = iced::window::Settings::default();
     win.icon = icon;
+
+    #[cfg(target_os = "macos")]
+    {
+        win.platform_specific.title_hidden = true;
+        win.platform_specific.titlebar_transparent = true;
+        win.platform_specific.fullsize_content_view = true;
+        // win.transparent = true; // TEMPORARILY DISABLED for debugging
+    }
 
     iced::application(
         move || {
@@ -1246,6 +1156,7 @@ pub fn run(cmd: Vec<String>) -> anyhow::Result<()> {
         State::view,
     )
     .subscription(State::subscription)
+    .theme(|_: &State| iced::Theme::Dark)
     .title("Golem Terminal")
     .window(win)
     .run()
@@ -1253,7 +1164,6 @@ pub fn run(cmd: Vec<String>) -> anyhow::Result<()> {
 }
 
 fn load_window_icon() -> Option<iced::window::Icon> {
-    // Use the kill icon as placeholder; replace with proper icon later
     let img = ::image::load_from_memory(include_bytes!("../assets/icon_kill.png"))
         .ok()?
         .into_rgba8();
@@ -1267,11 +1177,19 @@ fn load_window_icon() -> Option<iced::window::Icon> {
 mod tests {
     use super::*;
 
+    fn active_slot(state: &State) -> usize {
+        state.active_slot_idx().unwrap_or(0)
+    }
+
+    fn pane_count(state: &State) -> usize {
+        state.panes.len()
+    }
+
     #[test]
     fn new_state_has_one_tab() {
         let state = State::new(vec!["echo".into(), "hi".into()]);
         assert_eq!(state.slots.len(), 1);
-        assert_eq!(state.active_tab, 0);
+        assert_eq!(active_slot(&state), 0);
     }
 
     #[test]
@@ -1279,7 +1197,8 @@ mod tests {
         let mut state = State::new(vec!["echo".into()]);
         let _ = state.update(Message::NewTab);
         assert_eq!(state.slots.len(), 2);
-        assert_eq!(state.active_tab, 1);
+        // NewTab updates focused pane to show the new slot
+        assert_eq!(active_slot(&state), 1);
     }
 
     #[test]
@@ -1294,38 +1213,134 @@ mod tests {
         let mut state = State::new(vec!["echo".into()]);
         let _ = state.update(Message::NewTab);
         let _ = state.update(Message::NewTab);
-        assert_eq!(state.active_tab, 2);
+        assert_eq!(active_slot(&state), 2);
         let _ = state.update(Message::SwitchTab(1));
-        assert_eq!(state.active_tab, 0);
+        assert_eq!(active_slot(&state), 0);
+    }
+
+    #[test]
+    fn switch_tab_in_split_cycles_panes() {
+        let mut state = State::new(vec!["echo".into()]);
+        let _ = state.update(Message::NewTab);
+        let _ = state.update(Message::SelectTab(0));
+        let _ = state.update(Message::ToggleSplit);
+        assert!(pane_count(&state) > 1);
+        let before = active_slot(&state);
+        // SwitchTab in split mode should cycle focus between panes
+        let _ = state.update(Message::SwitchTab(1));
+        // Focus should have changed to a different pane (different slot)
+        let after = active_slot(&state);
+        assert_ne!(before, after, "focus should move to different pane");
     }
 
     #[test]
     fn toggle_split() {
         let mut state = State::new(vec!["echo".into()]);
         let _ = state.update(Message::NewTab);
-        assert!(!state.split_active);
+        assert_eq!(pane_count(&state), 1);
         let _ = state.update(Message::ToggleSplit);
-        assert!(state.split_active);
+        assert!(pane_count(&state) > 1, "toggle should create split");
         let _ = state.update(Message::ToggleSplit);
-        assert!(!state.split_active);
+        assert_eq!(pane_count(&state), 1, "toggle again should collapse");
     }
 
     #[test]
-    fn idle_launch_transitions_to_pending() {
-        let mut state = State::new(vec!["echo".into(), "hi".into()]);
-        assert_eq!(state.slots[0].status, AgentStatus::Idle);
-        let _ = state.update(Message::Launch(0));
-        assert_eq!(state.slots[0].status, AgentStatus::Pending);
-    }
-
-    #[test]
-    fn output_chunk_feeds_vt100_parser() {
+    fn select_tab_no_auto_launch() {
         let mut state = State::new(vec!["echo".into()]);
-        let _ = state.update(Message::OutputChunk {
-            slot: 0,
-            data: b"\x1b[31mhello\x1b[0m".to_vec(),
-        });
-        let content = state.slots[0].content_text();
-        assert!(content.contains("hello"));
+        let _ = state.update(Message::NewTab);
+        assert_eq!(state.slots[1].status, SlotStatus::Idle);
+        let _ = state.update(Message::SelectTab(1));
+        // SelectTab should NOT auto-launch — must stay idle
+        assert_eq!(state.slots[1].status, SlotStatus::Idle);
+    }
+
+    #[test]
+    fn switch_tab_wraps_backward() {
+        let mut state = State::new(vec!["echo".into()]);
+        let _ = state.update(Message::NewTab);
+        let _ = state.update(Message::SelectTab(0));
+        assert_eq!(active_slot(&state), 0);
+        let _ = state.update(Message::SwitchTab(-1));
+        assert_eq!(active_slot(&state), 1, "SwitchTab(-1) from 0 should wrap to last");
+    }
+
+    #[test]
+    fn close_tab_clamps_active_tab() {
+        let mut state = State::new(vec!["echo".into()]);
+        let _ = state.update(Message::NewTab);
+        let _ = state.update(Message::SelectTab(1));
+        assert_eq!(active_slot(&state), 1);
+        let _ = state.update(Message::CloseTab(1));
+        assert!(
+            active_slot(&state) < state.slots.len(),
+            "active_tab must clamp after closing last tab"
+        );
+    }
+
+    #[test]
+    fn select_tab_changes_active() {
+        let mut state = State::new(vec!["echo".into()]);
+        let _ = state.update(Message::NewTab);
+        let _ = state.update(Message::NewTab);
+        assert_eq!(active_slot(&state), 2);
+        let _ = state.update(Message::SelectTab(0));
+        assert_eq!(active_slot(&state), 0);
+    }
+
+    #[test]
+    fn split_focused_creates_new_pane() {
+        let mut state = State::new(vec!["echo".into()]);
+        assert_eq!(pane_count(&state), 1);
+        let _ = state.update(Message::SplitFocused(pane_grid::Axis::Horizontal));
+        assert_eq!(pane_count(&state), 2);
+        assert_eq!(state.slots.len(), 2, "split should create new slot");
+    }
+
+    #[test]
+    fn close_pane_merges() {
+        let mut state = State::new(vec!["echo".into()]);
+        let _ = state.update(Message::SplitFocused(pane_grid::Axis::Horizontal));
+        assert_eq!(pane_count(&state), 2);
+        let _ = state.update(Message::ClosePane);
+        assert_eq!(pane_count(&state), 1);
+    }
+
+    #[test]
+    fn close_pane_noop_when_single() {
+        let mut state = State::new(vec!["echo".into()]);
+        assert_eq!(pane_count(&state), 1);
+        let _ = state.update(Message::ClosePane);
+        assert_eq!(pane_count(&state), 1, "should not close the last pane");
+    }
+
+    #[test]
+    fn pane_clicked_sets_focus() {
+        let mut state = State::new(vec!["echo".into()]);
+        let _ = state.update(Message::SplitFocused(pane_grid::Axis::Horizontal));
+        // Get the non-focused pane
+        let other = state.panes.iter()
+            .find(|(p, _)| Some(**p) != state.focus)
+            .map(|(p, _)| *p)
+            .unwrap();
+        let _ = state.update(Message::PaneClicked(other));
+        assert_eq!(state.focus, Some(other));
+    }
+
+    #[test]
+    fn sidebar_toggles() {
+        let mut state = State::new(vec!["echo".into()]);
+        assert!(state.sidebar_visible);
+        let _ = state.update(Message::ToggleSidebar);
+        assert!(!state.sidebar_visible);
+        let _ = state.update(Message::ToggleSidebar);
+        assert!(state.sidebar_visible);
+    }
+
+    #[test]
+    fn new_tab_is_idle() {
+        let mut state = State::new(vec!["echo".into()]);
+        let _ = state.update(Message::NewTab);
+        // New tabs should be idle, not auto-launched
+        assert_eq!(state.slots[1].status, SlotStatus::Idle);
     }
 }

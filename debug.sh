@@ -110,7 +110,8 @@ def build_payload(args: list[str]) -> str:
         # Process escape sequences so "hello\r" works.
         data = data.encode().decode("unicode_escape")
         return json.dumps({"cmd": "send_input", "data": data, "slot": slot})
-    elif cmd in ("status", "output", "content", "launch", "kill", "quit"):
+    elif cmd in ("status", "output", "content", "launch", "kill", "quit",
+                  "toggle_split", "active_tab", "split_status", "select_tab"):
         return json.dumps({"cmd": cmd, "slot": slot})
     else:
         return json.dumps({"cmd": cmd, "slot": slot})
@@ -120,6 +121,8 @@ def run_interactive(sock_path: str) -> None:
     """Interactive REPL -- reconnects per command."""
     print(f"Connected to {sock_path}")
     print("Commands: status, output, content, send <text>, launch, kill, quit")
+    print("         new_tab, close_tab <slot>, select_tab <slot>, toggle_split")
+    print("         active_tab, split_status, slot_count")
     print("Append slot number for non-default slot (e.g. 'status 1')")
     print()
     while True:
