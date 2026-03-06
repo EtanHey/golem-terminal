@@ -613,6 +613,7 @@ impl State {
                             }
                         }
                     }
+                    self.sync_test_state();
                     return Task::none();
                 }
                 // Single pane — cycle the slot shown in it
