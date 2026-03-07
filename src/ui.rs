@@ -72,7 +72,7 @@ pub enum Message {
     KeyboardEvent(keyboard::Event),
     ClosePaneOrTab,
     ClearTerminal,
-    DeleteWordLeft,
+    DeleteLineLeft,
     DeleteLineRight,
     OptionDeleteWord,
 
@@ -317,7 +317,7 @@ impl ShortcutAction {
             Self::ToggleSplit => Message::ToggleSplit,
             Self::ClosePaneOrTab => Message::ClosePaneOrTab,
             Self::ClearTerminal => Message::ClearTerminal,
-            Self::DeleteLineLeft => Message::DeleteWordLeft,
+            Self::DeleteLineLeft => Message::DeleteLineLeft,
             Self::DeleteLineRight => Message::DeleteLineRight,
             Self::DeleteWordLeft => Message::OptionDeleteWord,
             Self::ToggleSidebar => Message::ToggleSidebar,
@@ -458,7 +458,7 @@ fn shortcut_action(
     };
 
     match action {
-        Some(action) if repeat && !action.repeats() => Some(action),
+        Some(action) if repeat && !action.repeats() => None,
         other => other,
     }
 }
@@ -1360,7 +1360,7 @@ impl State {
                 Task::none()
             }
 
-            Message::DeleteWordLeft => {
+            Message::DeleteLineLeft => {
                 // Cmd+Backspace matches iTerm's "delete to line start" mapping.
                 if let Some(slot_idx) = self.active_slot_idx() {
                     if let Some(slot) = self.slots.get_mut(slot_idx) {
