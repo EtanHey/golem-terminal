@@ -6,9 +6,13 @@
 
 use iced::widget::pane_grid::{self, PaneGrid};
 use iced::widget::{button, column, container, mouse_area, row, rule, text, Space};
-use iced::{keyboard, Length, Subscription, Task};
+use iced::{event, keyboard, Length, Subscription, Task};
 use std::sync::{Arc, Mutex};
 
+use iced::advanced::widget::tree::Tree;
+use iced::advanced::widget::Operation;
+use iced::advanced::{layout, mouse, overlay, renderer};
+use iced::advanced::{Clipboard, Layout, Shell, Widget};
 use iced_term::bindings::{Binding, BindingAction, InputKind};
 use iced_term::TerminalView;
 
@@ -26,6 +30,8 @@ const BORDER_RADIUS: f32 = 4.0;
 const RULE_THICKNESS: f32 = 1.0;
 const STATUS_DOT_SIZE: f32 = 8.0;
 const PANE_RESIZE_GRAB_AREA: f32 = 6.0;
+const ITERM_BACKGROUND: &str = "#1e1e1e";
+const ITERM_FOREGROUND: &str = "#d4d4d4";
 
 // ── Slot Status ──────────────────────────────────────────────────────────────
 
@@ -63,9 +69,12 @@ pub enum Message {
     TermEvent(iced_term::Event),
 
     // Keyboard shortcuts
+    KeyboardEvent(keyboard::Event),
     ClosePaneOrTab,
     ClearTerminal,
-    DeleteWordLeft,
+    DeleteLineLeft,
+    DeleteLineRight,
+    OptionDeleteWord,
 
     // Window
     Quit,
@@ -174,33 +183,33 @@ impl AgentSlot {
 
 fn iterm_color_palette() -> iced_term::ColorPalette {
     iced_term::ColorPalette {
-        foreground: "#d4d4d4".into(),
-        background: "#1e1e1e".into(),
+        foreground: ITERM_FOREGROUND.into(),
+        background: ITERM_BACKGROUND.into(),
         black: "#000000".into(),
-        red: "#cd3131".into(),
-        green: "#0dbc79".into(),
-        yellow: "#e5e510".into(),
-        blue: "#2472c8".into(),
-        magenta: "#bc3fbc".into(),
-        cyan: "#11a8cd".into(),
-        white: "#e5e5e5".into(),
-        bright_black: "#666666".into(),
-        bright_red: "#f14c4c".into(),
-        bright_green: "#23d18b".into(),
-        bright_yellow: "#f5f543".into(),
-        bright_blue: "#3b8eea".into(),
-        bright_magenta: "#d670d6".into(),
-        bright_cyan: "#29b8db".into(),
-        bright_white: "#e5e5e5".into(),
+        red: "#c91b00".into(),
+        green: "#00c200".into(),
+        yellow: "#c7c400".into(),
+        blue: "#0225c7".into(),
+        magenta: "#c930c7".into(),
+        cyan: "#00c5c7".into(),
+        white: "#c7c7c7".into(),
+        bright_black: "#676767".into(),
+        bright_red: "#ff6d67".into(),
+        bright_green: "#5ff967".into(),
+        bright_yellow: "#fefb67".into(),
+        bright_blue: "#6871ff".into(),
+        bright_magenta: "#ff76ff".into(),
+        bright_cyan: "#5ffdff".into(),
+        bright_white: "#feffff".into(),
         bright_foreground: None,
-        dim_foreground: "#828482".into(),
+        dim_foreground: "#9e9e9e".into(),
         dim_black: "#0f0f0f".into(),
-        dim_red: "#712b2b".into(),
-        dim_green: "#5f6f3a".into(),
-        dim_yellow: "#a17e4d".into(),
-        dim_blue: "#456877".into(),
-        dim_magenta: "#704d68".into(),
-        dim_cyan: "#4d7770".into(),
+        dim_red: "#8b3a2f".into(),
+        dim_green: "#4d7d5c".into(),
+        dim_yellow: "#8e8550".into(),
+        dim_blue: "#3f4f8f".into(),
+        dim_magenta: "#875289".into(),
+        dim_cyan: "#3f8789".into(),
         dim_white: "#8e8e8e".into(),
     }
 }
@@ -235,6 +244,37 @@ fn gui_shortcut_bindings() -> Vec<(Binding<InputKind>, BindingAction)> {
         swallow("t", cmd),       // Cmd+T → new tab
         swallow("w", cmd),       // Cmd+W → close pane
         swallow("q", cmd),       // Cmd+Q → quit
+        swallow("k", cmd),       // Cmd+K → clear terminal
+        swallow("n", cmd),       // Cmd+N → new tab (alias)
+        swallow("r", cmd),       // Cmd+R → clear screen
+        // Backspace with modifiers (prevent iced_term from processing)
+        (
+            Binding {
+                target: InputKind::KeyCode(iced::keyboard::key::Named::Backspace),
+                modifiers: cmd,
+                terminal_mode_include: iced_term::TermMode::empty(),
+                terminal_mode_exclude: iced_term::TermMode::empty(),
+            },
+            BindingAction::Ignore,
+        ),
+        (
+            Binding {
+                target: InputKind::KeyCode(iced::keyboard::key::Named::Backspace),
+                modifiers: Modifiers::ALT,
+                terminal_mode_include: iced_term::TermMode::empty(),
+                terminal_mode_exclude: iced_term::TermMode::empty(),
+            },
+            BindingAction::Ignore,
+        ),
+        (
+            Binding {
+                target: InputKind::KeyCode(iced::keyboard::key::Named::Delete),
+                modifiers: cmd,
+                terminal_mode_include: iced_term::TermMode::empty(),
+                terminal_mode_exclude: iced_term::TermMode::empty(),
+            },
+            BindingAction::Ignore,
+        ),
         // Cmd+1-9 → select tab
         swallow("1", cmd),
         swallow("2", cmd),
@@ -248,12 +288,386 @@ fn gui_shortcut_bindings() -> Vec<(Binding<InputKind>, BindingAction)> {
     ]
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShortcutAction {
+    SwitchTab(i32),
+    SplitVertical,
+    NewTab,
+    ToggleSplit,
+    ClosePaneOrTab,
+    ClearTerminal,
+    DeleteLineLeft,
+    DeleteLineRight,
+    DeleteWordLeft,
+    ToggleSidebar,
+    Quit,
+    SelectTab(usize),
+}
+
+impl ShortcutAction {
+    fn repeats(self) -> bool {
+        matches!(self, Self::SwitchTab(_))
+    }
+
+    fn message(self) -> Message {
+        match self {
+            Self::SwitchTab(delta) => Message::SwitchTab(delta),
+            Self::SplitVertical => Message::SplitFocused(pane_grid::Axis::Vertical),
+            Self::NewTab => Message::NewTab,
+            Self::ToggleSplit => Message::ToggleSplit,
+            Self::ClosePaneOrTab => Message::ClosePaneOrTab,
+            Self::ClearTerminal => Message::ClearTerminal,
+            Self::DeleteLineLeft => Message::DeleteLineLeft,
+            Self::DeleteLineRight => Message::DeleteLineRight,
+            Self::DeleteWordLeft => Message::OptionDeleteWord,
+            Self::ToggleSidebar => Message::ToggleSidebar,
+            Self::Quit => Message::Quit,
+            Self::SelectTab(idx) => Message::SelectTab(idx),
+        }
+    }
+}
+
+fn is_modifier_key(key: &keyboard::Key) -> bool {
+    matches!(
+        key,
+        keyboard::Key::Named(
+            keyboard::key::Named::Alt
+                | keyboard::key::Named::AltGraph
+                | keyboard::key::Named::Control
+                | keyboard::key::Named::Shift
+                | keyboard::key::Named::Meta
+                | keyboard::key::Named::Super
+        )
+    )
+}
+
+fn key_matches(key: &keyboard::Key, expected: &str) -> bool {
+    matches!(
+        key,
+        keyboard::Key::Character(value) if value.as_ref().eq_ignore_ascii_case(expected)
+    )
+}
+
+fn event_matches_char(key: &keyboard::Key, modified_key: &keyboard::Key, expected: &str) -> bool {
+    key_matches(key, expected) || key_matches(modified_key, expected)
+}
+
+fn merged_shortcut_modifiers(
+    event_modifiers: keyboard::Modifiers,
+    sticky_modifiers: keyboard::Modifiers,
+) -> keyboard::Modifiers {
+    let mut effective = event_modifiers;
+    effective.insert(sticky_modifiers);
+    effective
+}
+
+fn shortcut_action(
+    event: &keyboard::Event,
+    sticky_modifiers: keyboard::Modifiers,
+) -> Option<ShortcutAction> {
+    let (key, modified_key, modifiers, repeat) = match event {
+        keyboard::Event::KeyPressed {
+            key,
+            modified_key,
+            modifiers,
+            repeat,
+            ..
+        } => (key, modified_key, *modifiers, *repeat),
+        _ => return None,
+    };
+
+    let modifiers = merged_shortcut_modifiers(modifiers, sticky_modifiers);
+
+    let action = if modifiers.command() && modifiers.alt() {
+        match key {
+            keyboard::Key::Named(keyboard::key::Named::ArrowLeft)
+            | keyboard::Key::Named(keyboard::key::Named::ArrowUp) => {
+                Some(ShortcutAction::SwitchTab(-1))
+            }
+            keyboard::Key::Named(keyboard::key::Named::ArrowRight)
+            | keyboard::Key::Named(keyboard::key::Named::ArrowDown) => {
+                Some(ShortcutAction::SwitchTab(1))
+            }
+            _ => None,
+        }
+    } else if modifiers.command() {
+        match key {
+            keyboard::Key::Named(keyboard::key::Named::ArrowLeft) if !modifiers.shift() => {
+                Some(ShortcutAction::SwitchTab(-1))
+            }
+            keyboard::Key::Named(keyboard::key::Named::ArrowRight) if !modifiers.shift() => {
+                Some(ShortcutAction::SwitchTab(1))
+            }
+            keyboard::Key::Named(keyboard::key::Named::Backspace)
+                if !modifiers.alt() && !modifiers.control() =>
+            {
+                Some(ShortcutAction::DeleteLineLeft)
+            }
+            keyboard::Key::Named(keyboard::key::Named::Delete)
+                if !modifiers.alt() && !modifiers.control() =>
+            {
+                Some(ShortcutAction::DeleteLineRight)
+            }
+            _ if event_matches_char(key, modified_key, "d") && modifiers.shift() => {
+                Some(ShortcutAction::SplitVertical)
+            }
+            _ if event_matches_char(key, modified_key, "t")
+                || event_matches_char(key, modified_key, "n") =>
+            {
+                Some(ShortcutAction::NewTab)
+            }
+            _ if event_matches_char(key, modified_key, "d") => Some(ShortcutAction::ToggleSplit),
+            _ if event_matches_char(key, modified_key, "w") => Some(ShortcutAction::ClosePaneOrTab),
+            _ if event_matches_char(key, modified_key, "k")
+                || event_matches_char(key, modified_key, "r") =>
+            {
+                Some(ShortcutAction::ClearTerminal)
+            }
+            _ if event_matches_char(key, modified_key, "b") => Some(ShortcutAction::ToggleSidebar),
+            _ if event_matches_char(key, modified_key, "q") => Some(ShortcutAction::Quit),
+            _ if event_matches_char(key, modified_key, "[")
+                || event_matches_char(key, modified_key, "{") =>
+            {
+                Some(ShortcutAction::SwitchTab(-1))
+            }
+            _ if event_matches_char(key, modified_key, "]")
+                || event_matches_char(key, modified_key, "}") =>
+            {
+                Some(ShortcutAction::SwitchTab(1))
+            }
+            _ => {
+                let digit = match key {
+                    keyboard::Key::Character(value) => value.chars().next(),
+                    _ => None,
+                }
+                .and_then(|ch| ch.to_digit(10))
+                .filter(|digit| (1..=9).contains(digit));
+
+                digit.map(|digit| ShortcutAction::SelectTab((digit - 1) as usize))
+            }
+        }
+    } else if modifiers.alt() {
+        match key {
+            keyboard::Key::Named(keyboard::key::Named::Backspace) => {
+                Some(ShortcutAction::DeleteWordLeft)
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    match action {
+        Some(action) if repeat && !action.repeats() => None,
+        other => other,
+    }
+}
+
+fn should_capture_terminal_shortcut(
+    event: &keyboard::Event,
+    sticky_modifiers: keyboard::Modifiers,
+) -> bool {
+    shortcut_action(event, sticky_modifiers).is_some()
+}
+
+fn should_listen_to_keyboard_event(event: &keyboard::Event) -> bool {
+    match event {
+        keyboard::Event::ModifiersChanged(_) => true,
+        keyboard::Event::KeyPressed {
+            key, modified_key, ..
+        }
+        | keyboard::Event::KeyReleased {
+            key, modified_key, ..
+        } => {
+            is_modifier_key(key)
+                || matches!(
+                    key,
+                    keyboard::Key::Named(
+                        keyboard::key::Named::Enter
+                            | keyboard::key::Named::ArrowLeft
+                            | keyboard::key::Named::ArrowRight
+                            | keyboard::key::Named::ArrowUp
+                            | keyboard::key::Named::ArrowDown
+                            | keyboard::key::Named::Backspace
+                            | keyboard::key::Named::Delete
+                    )
+                )
+                || ["[", "]", "{", "}", "b", "d", "k", "n", "q", "r", "t", "w"]
+                    .iter()
+                    .any(|expected| event_matches_char(key, modified_key, expected))
+                || matches!(
+                    key,
+                    keyboard::Key::Character(value)
+                        if value.chars().next().is_some_and(|ch| ('1'..='9').contains(&ch))
+                )
+        }
+    }
+}
+
+fn keyboard_event_message(
+    event: iced::Event,
+    _status: iced::event::Status,
+    _window: iced::window::Id,
+) -> Option<Message> {
+    match event {
+        iced::Event::Keyboard(event) if should_listen_to_keyboard_event(&event) => {
+            Some(Message::KeyboardEvent(event))
+        }
+        _ => None,
+    }
+}
+
+fn capture_terminal_shortcuts<'a>(
+    content: impl Into<iced::Element<'a, Message>>,
+    keyboard_modifiers: keyboard::Modifiers,
+) -> iced::Element<'a, Message> {
+    struct Capture<'a> {
+        content: iced::Element<'a, Message>,
+        keyboard_modifiers: keyboard::Modifiers,
+    }
+
+    impl Widget<Message, iced::Theme, iced::Renderer> for Capture<'_> {
+        fn size(&self) -> iced::Size<Length> {
+            self.content.as_widget().size()
+        }
+
+        fn size_hint(&self) -> iced::Size<Length> {
+            self.content.as_widget().size_hint()
+        }
+
+        fn children(&self) -> Vec<Tree> {
+            vec![Tree::new(&self.content)]
+        }
+
+        fn diff(&self, tree: &mut Tree) {
+            tree.diff_children(&[&self.content]);
+        }
+
+        fn layout(
+            &mut self,
+            tree: &mut Tree,
+            renderer: &iced::Renderer,
+            limits: &layout::Limits,
+        ) -> layout::Node {
+            self.content
+                .as_widget_mut()
+                .layout(&mut tree.children[0], renderer, limits)
+        }
+
+        fn operate(
+            &mut self,
+            tree: &mut Tree,
+            layout: Layout<'_>,
+            renderer: &iced::Renderer,
+            operation: &mut dyn Operation,
+        ) {
+            self.content.as_widget_mut().operate(
+                &mut tree.children[0],
+                layout,
+                renderer,
+                operation,
+            );
+        }
+
+        fn update(
+            &mut self,
+            tree: &mut Tree,
+            event: &iced::Event,
+            layout: Layout<'_>,
+            cursor: mouse::Cursor,
+            renderer: &iced::Renderer,
+            clipboard: &mut dyn Clipboard,
+            shell: &mut Shell<'_, Message>,
+            viewport: &iced::Rectangle,
+        ) {
+            if let iced::Event::Keyboard(key_event) = event {
+                if should_capture_terminal_shortcut(key_event, self.keyboard_modifiers) {
+                    shell.capture_event();
+                    return;
+                }
+            }
+
+            self.content.as_widget_mut().update(
+                &mut tree.children[0],
+                event,
+                layout,
+                cursor,
+                renderer,
+                clipboard,
+                shell,
+                viewport,
+            );
+        }
+
+        fn mouse_interaction(
+            &self,
+            tree: &Tree,
+            layout: Layout<'_>,
+            cursor: mouse::Cursor,
+            viewport: &iced::Rectangle,
+            renderer: &iced::Renderer,
+        ) -> mouse::Interaction {
+            self.content.as_widget().mouse_interaction(
+                &tree.children[0],
+                layout,
+                cursor,
+                viewport,
+                renderer,
+            )
+        }
+
+        fn draw(
+            &self,
+            tree: &Tree,
+            renderer: &mut iced::Renderer,
+            theme: &iced::Theme,
+            style: &renderer::Style,
+            layout: Layout<'_>,
+            cursor: mouse::Cursor,
+            viewport: &iced::Rectangle,
+        ) {
+            self.content.as_widget().draw(
+                &tree.children[0],
+                renderer,
+                theme,
+                style,
+                layout,
+                cursor,
+                viewport,
+            );
+        }
+
+        fn overlay<'a>(
+            &'a mut self,
+            tree: &'a mut Tree,
+            layout: Layout<'a>,
+            renderer: &iced::Renderer,
+            viewport: &iced::Rectangle,
+            translation: iced::Vector,
+        ) -> Option<overlay::Element<'a, Message, iced::Theme, iced::Renderer>> {
+            self.content.as_widget_mut().overlay(
+                &mut tree.children[0],
+                layout,
+                renderer,
+                viewport,
+                translation,
+            )
+        }
+    }
+
+    iced::Element::new(Capture {
+        content: content.into(),
+        keyboard_modifiers,
+    })
+}
+
 // ── State ────────────────────────────────────────────────────────────────────
 
 pub struct State {
     pub slots: Vec<AgentSlot>,
     pub panes: pane_grid::State<usize>, // each pane stores a slot index
     pub focus: Option<pane_grid::Pane>,
+    pub keyboard_modifiers: keyboard::Modifiers,
     pub sidebar_visible: bool,
     pub base_cmd: Vec<String>,
     pub next_slot_id: usize,
@@ -287,6 +701,7 @@ impl State {
             slots: vec![slot],
             panes,
             focus: Some(first_pane),
+            keyboard_modifiers: keyboard::Modifiers::empty(),
             sidebar_visible: true,
             base_cmd: cmd,
             next_slot_id: 1,
@@ -303,9 +718,39 @@ impl State {
         state
     }
 
+    fn pane_slot_idx(&self, pane: pane_grid::Pane) -> Option<usize> {
+        self.panes
+            .get(pane)
+            .copied()
+            .filter(|&idx| idx < self.slots.len())
+    }
+
+    fn normalize_panes(&mut self) {
+        if self.slots.is_empty() {
+            return;
+        }
+
+        let last_valid = self.slots.len() - 1;
+        let pane_updates: Vec<(pane_grid::Pane, usize)> = self
+            .panes
+            .iter()
+            .filter_map(|(pane, &slot_idx)| (slot_idx > last_valid).then_some((*pane, last_valid)))
+            .collect();
+
+        for (pane, slot_idx) in pane_updates {
+            if let Some(slot_ref) = self.panes.get_mut(pane) {
+                *slot_ref = slot_idx;
+            }
+        }
+
+        if self.focus.and_then(|pane| self.panes.get(pane)).is_none() {
+            self.focus = self.panes.iter().next().map(|(pane, _)| *pane);
+        }
+    }
+
     /// The slot index of the focused pane, if any.
     pub fn active_slot_idx(&self) -> Option<usize> {
-        self.focus.and_then(|p| self.panes.get(p).copied())
+        self.focus.and_then(|p| self.pane_slot_idx(p))
     }
 
     /// Check if a slot index is currently visible in any pane.
@@ -412,7 +857,9 @@ impl State {
         // Try partial match (surface name contains label)
         self.agent_states
             .iter()
-            .find(|(surface, _)| surface.contains(&label_lower) || label_lower.contains(surface.as_str()))
+            .find(|(surface, _)| {
+                surface.contains(&label_lower) || label_lower.contains(surface.as_str())
+            })
             .map(|(_, state)| state)
     }
 
@@ -494,6 +941,54 @@ impl State {
         }
     }
 
+    fn update_keyboard_modifiers(&mut self, event: &keyboard::Event) {
+        match event {
+            keyboard::Event::ModifiersChanged(modifiers) => {
+                self.keyboard_modifiers = *modifiers;
+            }
+            keyboard::Event::KeyPressed { key, modifiers, .. } => {
+                self.keyboard_modifiers = *modifiers;
+                match key {
+                    keyboard::Key::Named(keyboard::key::Named::Alt)
+                    | keyboard::Key::Named(keyboard::key::Named::AltGraph) => {
+                        self.keyboard_modifiers.insert(keyboard::Modifiers::ALT);
+                    }
+                    keyboard::Key::Named(keyboard::key::Named::Control) => {
+                        self.keyboard_modifiers.insert(keyboard::Modifiers::CTRL);
+                    }
+                    keyboard::Key::Named(keyboard::key::Named::Shift) => {
+                        self.keyboard_modifiers.insert(keyboard::Modifiers::SHIFT);
+                    }
+                    keyboard::Key::Named(keyboard::key::Named::Meta)
+                    | keyboard::Key::Named(keyboard::key::Named::Super) => {
+                        self.keyboard_modifiers.insert(keyboard::Modifiers::COMMAND);
+                    }
+                    _ => {}
+                }
+            }
+            keyboard::Event::KeyReleased { key, modifiers, .. } => {
+                self.keyboard_modifiers = *modifiers;
+                match key {
+                    keyboard::Key::Named(keyboard::key::Named::Alt)
+                    | keyboard::Key::Named(keyboard::key::Named::AltGraph) => {
+                        self.keyboard_modifiers.remove(keyboard::Modifiers::ALT);
+                    }
+                    keyboard::Key::Named(keyboard::key::Named::Control) => {
+                        self.keyboard_modifiers.remove(keyboard::Modifiers::CTRL);
+                    }
+                    keyboard::Key::Named(keyboard::key::Named::Shift) => {
+                        self.keyboard_modifiers.remove(keyboard::Modifiers::SHIFT);
+                    }
+                    keyboard::Key::Named(keyboard::key::Named::Meta)
+                    | keyboard::Key::Named(keyboard::key::Named::Super) => {
+                        self.keyboard_modifiers.remove(keyboard::Modifiers::COMMAND);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     // ── Update ───────────────────────────────────────────────────────────────
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -509,20 +1004,62 @@ impl State {
         }
 
         let task = match message {
-            Message::LaunchSlot(idx) => {
-                if idx < self.slots.len() && self.slots[idx].status == SlotStatus::Idle {
-                    self.slots[idx].launch();
-                    if let Some(ref term) = self.slots[idx].terminal {
-                        self.sync_test_state();
-                        return TerminalView::focus(term.widget_id().clone());
+            Message::KeyboardEvent(event) => {
+                let sticky_modifiers = self.keyboard_modifiers;
+
+                if let Some(action) = shortcut_action(&event, sticky_modifiers) {
+                    self.update_keyboard_modifiers(&event);
+                    let repeats = matches!(event, keyboard::Event::KeyPressed { repeat: true, .. });
+                    if !repeats || action.repeats() {
+                        return self.update(action.message());
                     }
+                }
+
+                if let keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                    modifiers,
+                    repeat,
+                    ..
+                } = &event
+                {
+                    let modifiers = merged_shortcut_modifiers(*modifiers, sticky_modifiers);
+                    if !repeat && modifiers.is_empty() {
+                        if let Some(slot_idx) = self.active_slot_idx() {
+                            if self
+                                .slots
+                                .get(slot_idx)
+                                .is_some_and(|slot| slot.status == SlotStatus::Idle)
+                            {
+                                return self.update(Message::LaunchSlot(slot_idx));
+                            }
+                        }
+                    }
+                }
+
+                self.update_keyboard_modifiers(&event);
+                Task::none()
+            }
+
+            Message::LaunchSlot(idx) => {
+                let widget_id = if let Some(slot) = self.slots.get_mut(idx) {
+                    if slot.status != SlotStatus::Idle {
+                        return Task::none();
+                    }
+                    slot.launch();
+                    slot.terminal.as_ref().map(|term| term.widget_id().clone())
+                } else {
+                    None
+                };
+                if let Some(wid) = widget_id {
+                    self.sync_test_state();
+                    return TerminalView::focus(wid);
                 }
                 Task::none()
             }
 
             Message::KillSlot(idx) => {
-                if idx < self.slots.len() {
-                    self.slots[idx].kill();
+                if let Some(slot) = self.slots.get_mut(idx) {
+                    slot.kill();
                 }
                 Task::none()
             }
@@ -540,7 +1077,7 @@ impl State {
             }
 
             Message::SelectTab(idx) => {
-                if idx < self.slots.len() {
+                if self.slots.get(idx).is_some() {
                     // If this slot is already in a pane, focus that pane
                     if let Some(pane) = self.slot_in_pane(idx) {
                         self.focus = Some(pane);
@@ -551,7 +1088,8 @@ impl State {
                         }
                     }
                     // Focus the terminal widget
-                    if let Some(ref term) = self.slots[idx].terminal {
+                    if let Some(term) = self.slots.get(idx).and_then(|slot| slot.terminal.as_ref())
+                    {
                         self.sync_test_state();
                         return TerminalView::focus(term.widget_id().clone());
                     }
@@ -582,10 +1120,12 @@ impl State {
             }
 
             Message::CloseTab(idx) => {
-                if self.slots.len() <= 1 {
+                if self.slots.len() <= 1 || idx >= self.slots.len() {
                     return Task::none();
                 }
-                self.slots[idx].kill();
+                if let Some(slot) = self.slots.get_mut(idx) {
+                    slot.kill();
+                }
                 self.slots.remove(idx);
 
                 // Update all pane references: any pane pointing to idx or above
@@ -612,6 +1152,8 @@ impl State {
                     }
                 }
 
+                self.normalize_panes();
+
                 Task::none()
             }
 
@@ -631,13 +1173,13 @@ impl State {
                             .or_else(|| self.panes.adjacent(focused, fallback));
                         if let Some(adj) = adjacent {
                             self.focus = Some(adj);
-                            if let Some(&slot_idx) = self.panes.get(adj) {
-                                if slot_idx < self.slots.len() {
-                                    if let Some(ref term) = self.slots[slot_idx].terminal {
-                                        self.sync_test_state();
-                                        return TerminalView::focus(term.widget_id().clone());
-                                    }
-                                }
+                            if let Some(term) = self
+                                .pane_slot_idx(adj)
+                                .and_then(|slot_idx| self.slots.get(slot_idx))
+                                .and_then(|slot| slot.terminal.as_ref())
+                            {
+                                self.sync_test_state();
+                                return TerminalView::focus(term.widget_id().clone());
                             }
                         }
                     }
@@ -656,7 +1198,11 @@ impl State {
                         *slot_ref = new_idx;
                     }
                 }
-                if let Some(ref term) = self.slots[new_idx].terminal {
+                if let Some(term) = self
+                    .slots
+                    .get(new_idx)
+                    .and_then(|slot| slot.terminal.as_ref())
+                {
                     self.sync_test_state();
                     return TerminalView::focus(term.widget_id().clone());
                 }
@@ -703,13 +1249,14 @@ impl State {
                         }
                     }
                     // Focus the remaining pane's terminal
-                    if let Some(&slot_idx) = self.focus.and_then(|f| self.panes.get(f)) {
-                        if slot_idx < self.slots.len() {
-                            if let Some(ref term) = self.slots[slot_idx].terminal {
-                                self.sync_test_state();
-                                return TerminalView::focus(term.widget_id().clone());
-                            }
-                        }
+                    if let Some(term) = self
+                        .focus
+                        .and_then(|pane| self.pane_slot_idx(pane))
+                        .and_then(|slot_idx| self.slots.get(slot_idx))
+                        .and_then(|slot| slot.terminal.as_ref())
+                    {
+                        self.sync_test_state();
+                        return TerminalView::focus(term.widget_id().clone());
                     }
                 } else if let Some(focused) = self.focus {
                     // Only 1 pane → split vertically with a second slot
@@ -734,7 +1281,11 @@ impl State {
                             .split(pane_grid::Axis::Vertical, focused, secondary)
                     {
                         self.focus = Some(new_pane);
-                        if let Some(ref term) = self.slots[secondary].terminal {
+                        if let Some(term) = self
+                            .slots
+                            .get(secondary)
+                            .and_then(|slot| slot.terminal.as_ref())
+                        {
                             self.sync_test_state();
                             return TerminalView::focus(term.widget_id().clone());
                         }
@@ -748,13 +1299,14 @@ impl State {
                     if self.panes.len() > 1 {
                         if let Some((_, sibling)) = self.panes.close(focused) {
                             self.focus = Some(sibling);
-                            if let Some(&slot_idx) = self.panes.get(sibling) {
-                                if slot_idx < self.slots.len() {
-                                    if let Some(ref term) = self.slots[slot_idx].terminal {
-                                        self.sync_test_state();
-                                        return TerminalView::focus(term.widget_id().clone());
-                                    }
-                                }
+                            self.normalize_panes();
+                            if let Some(term) = self
+                                .pane_slot_idx(sibling)
+                                .and_then(|slot_idx| self.slots.get(slot_idx))
+                                .and_then(|slot| slot.terminal.as_ref())
+                            {
+                                self.sync_test_state();
+                                return TerminalView::focus(term.widget_id().clone());
                             }
                         }
                     }
@@ -768,13 +1320,14 @@ impl State {
                     if let Some(focused) = self.focus {
                         if let Some((_, sibling)) = self.panes.close(focused) {
                             self.focus = Some(sibling);
-                            if let Some(&slot_idx) = self.panes.get(sibling) {
-                                if slot_idx < self.slots.len() {
-                                    if let Some(ref term) = self.slots[slot_idx].terminal {
-                                        self.sync_test_state();
-                                        return TerminalView::focus(term.widget_id().clone());
-                                    }
-                                }
+                            self.normalize_panes();
+                            if let Some(term) = self
+                                .pane_slot_idx(sibling)
+                                .and_then(|slot_idx| self.slots.get(slot_idx))
+                                .and_then(|slot| slot.terminal.as_ref())
+                            {
+                                self.sync_test_state();
+                                return TerminalView::focus(term.widget_id().clone());
                             }
                         }
                     }
@@ -807,13 +1360,42 @@ impl State {
                 Task::none()
             }
 
-            Message::DeleteWordLeft => {
-                // Send Ctrl+W (delete word backward) to focused terminal
+            Message::DeleteLineLeft => {
+                // Cmd+Backspace matches iTerm's "delete to line start" mapping.
                 if let Some(slot_idx) = self.active_slot_idx() {
                     if let Some(slot) = self.slots.get_mut(slot_idx) {
                         if let Some(ref mut terminal) = slot.terminal {
                             let cmd = iced_term::Command::ProxyToBackend(
-                                iced_term::backend::Command::Write(vec![0x17]), // Ctrl+W
+                                iced_term::backend::Command::Write(vec![0x15]), // Ctrl+U
+                            );
+                            terminal.handle(cmd);
+                        }
+                    }
+                }
+                Task::none()
+            }
+
+            Message::DeleteLineRight => {
+                if let Some(slot_idx) = self.active_slot_idx() {
+                    if let Some(slot) = self.slots.get_mut(slot_idx) {
+                        if let Some(ref mut terminal) = slot.terminal {
+                            let cmd = iced_term::Command::ProxyToBackend(
+                                iced_term::backend::Command::Write(vec![0x0b]), // Ctrl+K
+                            );
+                            terminal.handle(cmd);
+                        }
+                    }
+                }
+                Task::none()
+            }
+
+            Message::OptionDeleteWord => {
+                // Send ESC+DEL (Option+Backspace word delete) to focused terminal
+                if let Some(slot_idx) = self.active_slot_idx() {
+                    if let Some(slot) = self.slots.get_mut(slot_idx) {
+                        if let Some(ref mut terminal) = slot.terminal {
+                            let cmd = iced_term::Command::ProxyToBackend(
+                                iced_term::backend::Command::Write(vec![0x1b, 0x7f]),
                             );
                             terminal.handle(cmd);
                         }
@@ -824,21 +1406,30 @@ impl State {
 
             Message::PaneClicked(pane) => {
                 self.focus = Some(pane);
-                if let Some(&slot_idx) = self.panes.get(pane) {
-                    if slot_idx < self.slots.len() {
-                        // If terminal is running, focus it
-                        if let Some(ref term) = self.slots[slot_idx].terminal {
-                            self.sync_test_state();
-                            return TerminalView::focus(term.widget_id().clone());
+                if let Some(slot_idx) = self.pane_slot_idx(pane) {
+                    // If terminal is running, focus it
+                    if let Some(term) = self
+                        .slots
+                        .get(slot_idx)
+                        .and_then(|slot| slot.terminal.as_ref())
+                    {
+                        self.sync_test_state();
+                        return TerminalView::focus(term.widget_id().clone());
+                    }
+                    // If idle, launch it
+                    let launch_wid = if let Some(slot) = self.slots.get_mut(slot_idx) {
+                        if slot.status == SlotStatus::Idle {
+                            slot.launch();
+                            slot.terminal.as_ref().map(|term| term.widget_id().clone())
+                        } else {
+                            None
                         }
-                        // If idle, launch it
-                        if self.slots[slot_idx].status == SlotStatus::Idle {
-                            self.slots[slot_idx].launch();
-                            if let Some(ref term) = self.slots[slot_idx].terminal {
-                                self.sync_test_state();
-                                return TerminalView::focus(term.widget_id().clone());
-                            }
-                        }
+                    } else {
+                        None
+                    };
+                    if let Some(wid) = launch_wid {
+                        self.sync_test_state();
+                        return TerminalView::focus(wid);
                     }
                 }
                 Task::none()
@@ -872,13 +1463,13 @@ impl State {
             Message::ToggleSidebar => {
                 self.sidebar_visible = !self.sidebar_visible;
                 // Re-focus current terminal
-                if let Some(slot_idx) = self.active_slot_idx() {
-                    if slot_idx < self.slots.len() {
-                        if let Some(ref term) = self.slots[slot_idx].terminal {
-                            self.sync_test_state();
-                            return TerminalView::focus(term.widget_id().clone());
-                        }
-                    }
+                if let Some(term) = self
+                    .active_slot_idx()
+                    .and_then(|slot_idx| self.slots.get(slot_idx))
+                    .and_then(|slot| slot.terminal.as_ref())
+                {
+                    self.sync_test_state();
+                    return TerminalView::focus(term.widget_id().clone());
                 }
                 Task::none()
             }
@@ -959,88 +1550,7 @@ impl State {
             }
         }
 
-        // GUI shortcuts (Cmd-based, not forwarded to terminal)
-        subscriptions.push(keyboard::listen().map(|event| match event {
-            // Cmd+Alt+Left/Right → SwitchTab (cycles panes or tabs)
-            keyboard::Event::KeyPressed { key, modifiers, .. }
-                if modifiers.command() && modifiers.alt() =>
-            {
-                match key {
-                    keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => Message::SwitchTab(-1),
-                    keyboard::Key::Named(keyboard::key::Named::ArrowRight) => Message::SwitchTab(1),
-                    keyboard::Key::Named(keyboard::key::Named::ArrowUp) => Message::SwitchTab(-1),
-                    keyboard::Key::Named(keyboard::key::Named::ArrowDown) => Message::SwitchTab(1),
-                    _ => Message::KeyboardIgnored,
-                }
-            }
-            // Cmd+Shift+D → split vertical
-            keyboard::Event::KeyPressed {
-                key: keyboard::Key::Character(ref c),
-                modifiers,
-                ..
-            } if c.as_ref() == "d" && modifiers.command() && modifiers.shift() => {
-                Message::SplitFocused(pane_grid::Axis::Vertical)
-            }
-            // Cmd+T → new tab
-            keyboard::Event::KeyPressed {
-                key: keyboard::Key::Character(ref c),
-                modifiers,
-                ..
-            } if c.as_ref() == "t" && modifiers.command() => Message::NewTab,
-            // Cmd+D → toggle split (1 pane ↔ 2 panes side-by-side)
-            keyboard::Event::KeyPressed {
-                key: keyboard::Key::Character(ref c),
-                modifiers,
-                ..
-            } if c.as_ref() == "d" && modifiers.command() => Message::ToggleSplit,
-            // Cmd+W → close pane (split) or close tab (single pane)
-            keyboard::Event::KeyPressed {
-                key: keyboard::Key::Character(ref c),
-                modifiers,
-                ..
-            } if c.as_ref() == "w" && modifiers.command() => Message::ClosePaneOrTab,
-            // Cmd+K → clear terminal
-            keyboard::Event::KeyPressed {
-                key: keyboard::Key::Character(ref c),
-                modifiers,
-                ..
-            } if c.as_ref() == "k" && modifiers.command() => Message::ClearTerminal,
-            // Cmd+Backspace → delete word left (send Ctrl+W to PTY)
-            keyboard::Event::KeyPressed {
-                key: keyboard::Key::Named(keyboard::key::Named::Backspace),
-                modifiers,
-                ..
-            } if modifiers.command() => Message::DeleteWordLeft,
-            // Cmd+B → toggle sidebar
-            keyboard::Event::KeyPressed {
-                key: keyboard::Key::Character(ref c),
-                modifiers,
-                ..
-            } if c.as_ref() == "b" && modifiers.command() => Message::ToggleSidebar,
-            // Cmd+Q → quit
-            keyboard::Event::KeyPressed {
-                key: keyboard::Key::Character(ref c),
-                modifiers,
-                ..
-            } if c.as_ref() == "q" && modifiers.command() => Message::Quit,
-            // Cmd+1-9 → select tab
-            keyboard::Event::KeyPressed {
-                key: keyboard::Key::Character(ref c),
-                modifiers,
-                ..
-            } if modifiers.command() => {
-                if let Some(d) = c.chars().next().and_then(|ch| ch.to_digit(10)) {
-                    if d >= 1 && d <= 9 {
-                        Message::SelectTab((d - 1) as usize)
-                    } else {
-                        Message::KeyboardIgnored
-                    }
-                } else {
-                    Message::KeyboardIgnored
-                }
-            }
-            _ => Message::KeyboardIgnored,
-        }));
+        subscriptions.push(event::listen_with(keyboard_event_message));
 
         // Agent state polling (every 2 seconds)
         subscriptions.push(
@@ -1107,7 +1617,7 @@ impl State {
 
     fn view_pane_content(&self, slot_idx: usize, _is_focused: bool) -> iced::Element<'_, Message> {
         let text_secondary = parse_hex_color(&self.config.ui.colors.text_secondary);
-        let bg_primary = parse_hex_color(&self.config.ui.colors.bg_primary);
+        let terminal_bg = crate::config::parse_hex_color(ITERM_BACKGROUND);
         let font_small = self.config.ui.font.small;
         let font_tiny = self.config.ui.font.tiny;
 
@@ -1123,14 +1633,17 @@ impl State {
         let slot = &self.slots[slot_idx];
 
         let terminal_view: iced::Element<'_, Message> = if let Some(ref term) = slot.terminal {
-            container(TerminalView::show(term).map(Message::TermEvent))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .style(move |_theme| container::Style {
-                    background: Some(iced::Background::Color(bg_primary)),
-                    ..Default::default()
-                })
-                .into()
+            container(capture_terminal_shortcuts(
+                TerminalView::show(term).map(Message::TermEvent),
+                self.keyboard_modifiers,
+            ))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(move |_theme| container::Style {
+                background: Some(iced::Background::Color(terminal_bg)),
+                ..Default::default()
+            })
+            .into()
         } else {
             // Idle state — show launch prompt
             let launch_text = column![
@@ -1150,7 +1663,7 @@ impl State {
                     .align_y(iced::Alignment::Center),
             )
             .style(move |_theme, _status| iced::widget::button::Style {
-                background: Some(iced::Background::Color(bg_primary)),
+                background: Some(iced::Background::Color(terminal_bg)),
                 ..Default::default()
             })
             .width(Length::Fill)
@@ -1304,26 +1817,27 @@ impl State {
                     let label_widget = text(&golem.name).size(font_tab).color(label_color);
                     let dot = text("●").size(STATUS_DOT_SIZE).color(dot_color);
 
-                    let top_row =
-                        row![icon_text, label_widget, Space::new().width(Length::Fill), dot]
-                            .spacing(SPACING_TIGHT)
-                            .align_y(iced::Alignment::Center);
+                    let top_row = row![
+                        icon_text,
+                        label_widget,
+                        Space::new().width(Length::Fill),
+                        dot
+                    ]
+                    .spacing(SPACING_TIGHT)
+                    .align_y(iced::Alignment::Center);
 
                     // Build tab content: top row + optional subtitle from agent state
-                    let tab_content: iced::Element<'_, Message> =
-                        if let Some(ext) = ext_state {
-                            let summary = ext.sidebar_summary();
-                            if summary.is_empty() {
-                                top_row.into()
-                            } else {
-                                let subtitle = text(summary)
-                                    .size(font_tiny)
-                                    .color(text_secondary);
-                                column![top_row, subtitle].spacing(1).into()
-                            }
-                        } else {
+                    let tab_content: iced::Element<'_, Message> = if let Some(ext) = ext_state {
+                        let summary = ext.sidebar_summary();
+                        if summary.is_empty() {
                             top_row.into()
-                        };
+                        } else {
+                            let subtitle = text(summary).size(font_tiny).color(text_secondary);
+                            column![top_row, subtitle].spacing(1).into()
+                        }
+                    } else {
+                        top_row.into()
+                    };
 
                     let is_bordered = slot_idx.map_or(false, |idx| {
                         active_slot == Some(idx) || visible_slots.contains(&idx)
@@ -1643,6 +2157,23 @@ fn load_window_icon() -> Option<iced::window::Icon> {
 mod tests {
     use super::*;
 
+    fn key_pressed(
+        key: keyboard::Key,
+        modified_key: keyboard::Key,
+        physical_key: keyboard::key::Physical,
+        modifiers: keyboard::Modifiers,
+    ) -> keyboard::Event {
+        keyboard::Event::KeyPressed {
+            key,
+            modified_key,
+            physical_key,
+            location: keyboard::Location::Standard,
+            modifiers,
+            text: None,
+            repeat: false,
+        }
+    }
+
     fn active_slot(state: &State) -> usize {
         state.active_slot_idx().unwrap_or(0)
     }
@@ -1672,6 +2203,14 @@ mod tests {
         let mut state = State::new(vec!["echo".into()]);
         let _ = state.update(Message::CloseTab(0));
         assert_eq!(state.slots.len(), 1);
+    }
+
+    #[test]
+    fn close_tab_ignores_stale_index() {
+        let mut state = State::new(vec!["echo".into()]);
+        let _ = state.update(Message::NewTab);
+        let _ = state.update(Message::CloseTab(99));
+        assert_eq!(state.slots.len(), 2);
     }
 
     #[test]
@@ -1745,6 +2284,19 @@ mod tests {
             active_slot(&state) < state.slots.len(),
             "active_tab must clamp after closing last tab"
         );
+    }
+
+    #[test]
+    fn active_slot_idx_ignores_stale_pane_slot_reference() {
+        let mut state = State::new(vec!["echo".into()]);
+        if let Some(focused) = state.focus {
+            if let Some(slot_ref) = state.panes.get_mut(focused) {
+                *slot_ref = 99;
+            }
+        }
+        assert_eq!(state.active_slot_idx(), None);
+        state.normalize_panes();
+        assert_eq!(state.active_slot_idx(), Some(0));
     }
 
     #[test]
@@ -1961,7 +2513,11 @@ mod tests {
         let _ = state.update(Message::SelectTab(1));
         // ClosePaneOrTab in single-pane mode should close the tab
         let _ = state.update(Message::ClosePaneOrTab);
-        assert_eq!(state.slots.len(), 1, "tab should be removed in single-pane mode");
+        assert_eq!(
+            state.slots.len(),
+            1,
+            "tab should be removed in single-pane mode"
+        );
     }
 
     #[test]
@@ -1971,5 +2527,72 @@ mod tests {
         assert_eq!(state.panes.len(), 2, "should have 2 panes after split");
         let _ = state.update(Message::ClosePaneOrTab);
         assert_eq!(state.panes.len(), 1, "should close pane, not tab");
+    }
+
+    #[test]
+    fn pane_clicked_with_stale_slot_index_is_noop() {
+        let mut state = State::new(vec!["echo".into()]);
+        let pane = state.focus.unwrap();
+        if let Some(slot_ref) = state.panes.get_mut(pane) {
+            *slot_ref = 99;
+        }
+        let _ = state.update(Message::PaneClicked(pane));
+        assert_eq!(state.focus, Some(pane));
+        assert_eq!(state.active_slot_idx(), None);
+    }
+
+    #[test]
+    fn shortcut_action_uses_sticky_command_modifiers() {
+        let event = key_pressed(
+            keyboard::Key::Character("k".into()),
+            keyboard::Key::Character("k".into()),
+            keyboard::key::Physical::Code(keyboard::key::Code::KeyK),
+            keyboard::Modifiers::empty(),
+        );
+
+        assert_eq!(
+            shortcut_action(&event, keyboard::Modifiers::COMMAND),
+            Some(ShortcutAction::ClearTerminal)
+        );
+    }
+
+    #[test]
+    fn keyboard_event_enter_launches_idle_active_slot() {
+        let mut state = State::new(vec!["echo".into()]);
+        let enter = key_pressed(
+            keyboard::Key::Named(keyboard::key::Named::Enter),
+            keyboard::Key::Named(keyboard::key::Named::Enter),
+            keyboard::key::Physical::Code(keyboard::key::Code::Enter),
+            keyboard::Modifiers::empty(),
+        );
+
+        let _ = state.update(Message::KeyboardEvent(enter));
+
+        assert_eq!(state.slots[0].status, SlotStatus::Running);
+    }
+
+    #[test]
+    fn shortcut_action_maps_iterm_tab_navigation_variants() {
+        let cmd_left = key_pressed(
+            keyboard::Key::Named(keyboard::key::Named::ArrowLeft),
+            keyboard::Key::Named(keyboard::key::Named::ArrowLeft),
+            keyboard::key::Physical::Code(keyboard::key::Code::ArrowLeft),
+            keyboard::Modifiers::COMMAND,
+        );
+        let cmd_shift_bracket = key_pressed(
+            keyboard::Key::Character("[".into()),
+            keyboard::Key::Character("{".into()),
+            keyboard::key::Physical::Code(keyboard::key::Code::BracketLeft),
+            keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT,
+        );
+
+        assert_eq!(
+            shortcut_action(&cmd_left, keyboard::Modifiers::empty()),
+            Some(ShortcutAction::SwitchTab(-1))
+        );
+        assert_eq!(
+            shortcut_action(&cmd_shift_bracket, keyboard::Modifiers::empty()),
+            Some(ShortcutAction::SwitchTab(-1))
+        );
     }
 }
