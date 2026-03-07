@@ -2134,11 +2134,11 @@ fn apply_sidebar_vibrancy(sidebar_width: f32) -> bool {
     autoreleasepool(|_pool| {
         let app = NSApplication::sharedApplication(mtm);
 
-        let Some(window) = (unsafe { app.keyWindow() }) else {
+        let Some(window) = app.keyWindow() else {
             eprintln!("[vibrancy] no key window");
             return;
         };
-        let Some(content_view) = (unsafe { window.contentView() }) else {
+        let Some(content_view) = window.contentView() else {
             eprintln!("[vibrancy] no content view");
             return;
         };
