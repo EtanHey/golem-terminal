@@ -155,6 +155,9 @@ mod tests {
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
     use std::io::Read;
 
+    const READ_BUF_SIZE: usize = 1024;
+    const READER_TIMEOUT_SECS: u64 = 5;
+
     fn open_pty() -> portable_pty::PtyPair {
         native_pty_system()
             .openpty(PtySize {
@@ -185,7 +188,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
         std::thread::spawn(move || {
             let mut buf = Vec::new();
-            let mut tmp = [0u8; 1024];
+            let mut tmp = [0u8; READ_BUF_SIZE];
             loop {
                 match reader.read(&mut tmp) {
                     Ok(0) => break,
@@ -202,8 +205,8 @@ mod tests {
         // After the child exits all slave fds are closed, so the reader
         // thread will see EIO and finish quickly.  5 s is a generous bound.
         let raw = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap_or_default();
+            .recv_timeout(std::time::Duration::from_secs(READER_TIMEOUT_SECS))
+            .unwrap_or_else(|e| panic!("timeout waiting for pty output: {e}"));
         let output = String::from_utf8_lossy(&raw);
         assert!(
             output.contains("hello"),
