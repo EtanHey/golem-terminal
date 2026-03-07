@@ -30,6 +30,10 @@ const BORDER_RADIUS: f32 = 4.0;
 const RULE_THICKNESS: f32 = 1.0;
 const STATUS_DOT_SIZE: f32 = 8.0;
 const PANE_RESIZE_GRAB_AREA: f32 = 6.0;
+// Sidebar group layout
+const SIDEBAR_SUBTITLE_SPACING: f32 = 1.0;
+const SIDEBAR_STRIP_WIDTH: f32 = 2.0;
+const SIDEBAR_INDENT: f32 = 8.0;
 const ITERM_BACKGROUND: &str = "#1e1e1e";
 const ITERM_FOREGROUND: &str = "#d4d4d4";
 
@@ -1774,12 +1778,23 @@ impl State {
                         let golem_color = parse_hex_color(&golem.color);
                         let golem_name = golem.name.clone();
 
-                        // Check if this golem has a running slot
-                        let running_slot = self
-                            .slots
-                            .iter()
-                            .enumerate()
-                            .find(|(_, s)| s.label == golem.name);
+                        // Find the best slot for this golem: prefer active > visible > first match.
+                        let running_slot = {
+                            let matches: Vec<(usize, &AgentSlot)> = self
+                                .slots
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, s)| s.label == golem.name)
+                                .collect();
+                            matches
+                                .iter()
+                                .find(|(idx, _)| active_slot == Some(*idx))
+                                .or_else(|| {
+                                    matches.iter().find(|(idx, _)| visible_slots.contains(idx))
+                                })
+                                .or_else(|| matches.first())
+                                .copied()
+                        };
 
                         let (dot_color, label_color, bg, border_color, on_press, slot_idx) =
                             if let Some((idx, slot)) = running_slot {
@@ -1828,6 +1843,7 @@ impl State {
                                 "running" => status_running,
                                 "pending" => status_pending,
                                 "error" => status_error,
+                                "idle" => status_idle,
                                 _ => dot_color,
                             }
                         } else {
@@ -1854,7 +1870,9 @@ impl State {
                                 top_row.into()
                             } else {
                                 let subtitle = text(summary).size(font_tiny).color(text_secondary);
-                                column![top_row, subtitle].spacing(1).into()
+                                column![top_row, subtitle]
+                                    .spacing(SIDEBAR_SUBTITLE_SPACING)
+                                    .into()
                             }
                         } else {
                             top_row.into()
@@ -1869,14 +1887,18 @@ impl State {
                                 background: Some(iced::Background::Color(bg)),
                                 border: iced::Border {
                                     color: border_color,
-                                    width: if is_bordered { 2.0 } else { 0.0 },
+                                    width: if is_bordered {
+                                        SIDEBAR_STRIP_WIDTH
+                                    } else {
+                                        0.0
+                                    },
                                     radius: iced::border::radius(0.0)
                                         .top_right(BORDER_RADIUS)
                                         .bottom_right(BORDER_RADIUS),
                                 },
                                 ..Default::default()
                             })
-                            .padding([SPACING_TIGHT, SPACING_NORMAL + 8.0]) // indent under group
+                            .padding([SPACING_TIGHT, SPACING_NORMAL + SIDEBAR_INDENT]) // indent under group
                             .width(Length::Fill);
 
                         let tab_element: iced::Element<'_, Message> = if let Some(idx) = slot_idx {
@@ -1906,9 +1928,9 @@ impl State {
                     }
                 }
 
-                // 2px accent strip on the left edge of the group section.
+                // Accent strip on the left edge of the group section.
                 let accent_strip = container(Space::new())
-                    .width(2.0)
+                    .width(SIDEBAR_STRIP_WIDTH)
                     .height(Length::Fill)
                     .style(move |_theme| container::Style {
                         background: Some(iced::Background::Color(group_color)),
@@ -2636,6 +2658,11 @@ mod tests {
             .insert("empty".into(), vec!["nobody".into()]);
         let accent = state.config.ui.colors.accent.clone();
         assert_eq!(state.group_accent_color("empty"), accent.as_str());
+        // Completely unknown group (not in config.groups) → also falls back to accent.
+        assert_eq!(
+            state.group_accent_color("nonexistent_group_name"),
+            accent.as_str()
+        );
     }
 
     #[test]
