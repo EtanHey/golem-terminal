@@ -155,6 +155,9 @@ mod tests {
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
     use std::io::Read;
 
+    const READ_BUF_SIZE: usize = 1024;
+    const READER_TIMEOUT_SECS: u64 = 5;
+
     fn open_pty() -> portable_pty::PtyPair {
         native_pty_system()
             .openpty(PtySize {
@@ -178,12 +181,33 @@ mod tests {
 
         let mut reader = pair.master.try_clone_reader().expect("clone reader");
 
-        // read_to_string blocks until EOF (master closes after child exits).
-        let mut output = String::new();
-        let _ = reader.read_to_string(&mut output);
+        // Collect output in a background thread using a raw read loop.
+        // `read_to_string` can discard partial data when it hits EIO (the
+        // macOS PTY error returned once all slave fds close).  Reading bytes
+        // directly avoids the UTF-8 guard that gates writes to the String.
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; READ_BUF_SIZE];
+            loop {
+                match reader.read(&mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                    Err(_) => break, // EIO / EOF on slave close
+                }
+            }
+            let _ = tx.send(buf);
+        });
 
         let status = child.wait().expect("wait");
         assert_eq!(status.exit_code(), 0, "expected exit code 0");
+
+        // After the child exits all slave fds are closed, so the reader
+        // thread will see EIO and finish quickly.  5 s is a generous bound.
+        let raw = rx
+            .recv_timeout(std::time::Duration::from_secs(READER_TIMEOUT_SECS))
+            .unwrap_or_else(|e| panic!("timeout waiting for pty output: {e}"));
+        let output = String::from_utf8_lossy(&raw);
         assert!(
             output.contains("hello"),
             "expected 'hello' in PTY output, got: {output:?}"
