@@ -36,6 +36,8 @@ const SIDEBAR_STRIP_WIDTH: f32 = 2.0;
 const SIDEBAR_INDENT: f32 = 8.0;
 const ITERM_BACKGROUND: &str = "#1e1e1e";
 const ITERM_FOREGROUND: &str = "#d4d4d4";
+const CLEAR_TERMINAL_SEQUENCE: &[u8] = b"\x1b[2J\x1b[3J\x1b[H";
+const FORWARD_DELETE_SEQUENCE: &[u8] = b"\x1b[3~";
 
 // ── Slot Status ──────────────────────────────────────────────────────────────
 
@@ -76,6 +78,7 @@ pub enum Message {
     KeyboardEvent(keyboard::Event),
     ClosePaneOrTab,
     ClearTerminal,
+    DeleteForward,
     DeleteLineLeft,
     OptionDeleteWord,
 
@@ -299,6 +302,7 @@ enum ShortcutAction {
     ToggleSplit,
     ClosePaneOrTab,
     ClearTerminal,
+    DeleteForward,
     DeleteLineLeft,
     DeleteWordLeft,
     ToggleSidebar,
@@ -319,6 +323,7 @@ impl ShortcutAction {
             Self::ToggleSplit => Message::ToggleSplit,
             Self::ClosePaneOrTab => Message::ClosePaneOrTab,
             Self::ClearTerminal => Message::ClearTerminal,
+            Self::DeleteForward => Message::DeleteForward,
             Self::DeleteLineLeft => Message::DeleteLineLeft,
             Self::DeleteWordLeft => Message::OptionDeleteWord,
             Self::ToggleSidebar => Message::ToggleSidebar,
@@ -392,62 +397,64 @@ fn shortcut_action(
             _ => None,
         }
     } else if modifiers.command() {
-        match key {
-            keyboard::Key::Named(keyboard::key::Named::ArrowLeft) if !modifiers.shift() => {
-                Some(ShortcutAction::SwitchTab(-1))
-            }
-            keyboard::Key::Named(keyboard::key::Named::ArrowRight) if !modifiers.shift() => {
-                Some(ShortcutAction::SwitchTab(1))
-            }
-            keyboard::Key::Named(keyboard::key::Named::Backspace)
-                if !modifiers.alt() && !modifiers.control() =>
-            {
-                Some(ShortcutAction::DeleteLineLeft)
-            }
-            keyboard::Key::Named(keyboard::key::Named::Delete)
-                if !modifiers.alt() && !modifiers.control() =>
-            {
-                // Cmd+Delete (forward-delete key) mirrors Cmd+Backspace: both
-                // map to "delete to line start" (Ctrl+U), matching macOS
-                // system-wide Cmd+Delete behaviour in text fields.
-                Some(ShortcutAction::DeleteLineLeft)
-            }
-            _ if event_matches_char(key, modified_key, "d") && modifiers.shift() => {
-                Some(ShortcutAction::SplitVertical)
-            }
-            _ if event_matches_char(key, modified_key, "t")
-                || event_matches_char(key, modified_key, "n") =>
-            {
-                Some(ShortcutAction::NewTab)
-            }
-            _ if event_matches_char(key, modified_key, "d") => Some(ShortcutAction::ToggleSplit),
-            _ if event_matches_char(key, modified_key, "w") => Some(ShortcutAction::ClosePaneOrTab),
-            _ if event_matches_char(key, modified_key, "k")
-                || event_matches_char(key, modified_key, "r") =>
-            {
-                Some(ShortcutAction::ClearTerminal)
-            }
-            _ if event_matches_char(key, modified_key, "b") => Some(ShortcutAction::ToggleSidebar),
-            _ if event_matches_char(key, modified_key, "q") => Some(ShortcutAction::Quit),
-            _ if event_matches_char(key, modified_key, "[")
-                || event_matches_char(key, modified_key, "{") =>
-            {
-                Some(ShortcutAction::SwitchTab(-1))
-            }
-            _ if event_matches_char(key, modified_key, "]")
-                || event_matches_char(key, modified_key, "}") =>
-            {
-                Some(ShortcutAction::SwitchTab(1))
-            }
-            _ => {
-                let digit = match key {
-                    keyboard::Key::Character(value) => value.chars().next(),
-                    _ => None,
+        if is_forward_delete_key(event) && !modifiers.alt() && !modifiers.control() {
+            Some(ShortcutAction::DeleteLineLeft)
+        } else {
+            match key {
+                keyboard::Key::Named(keyboard::key::Named::ArrowLeft) if !modifiers.shift() => {
+                    Some(ShortcutAction::SwitchTab(-1))
                 }
-                .and_then(|ch| ch.to_digit(10))
-                .filter(|digit| (1..=9).contains(digit));
+                keyboard::Key::Named(keyboard::key::Named::ArrowRight) if !modifiers.shift() => {
+                    Some(ShortcutAction::SwitchTab(1))
+                }
+                keyboard::Key::Named(keyboard::key::Named::Backspace)
+                    if !modifiers.alt() && !modifiers.control() =>
+                {
+                    Some(ShortcutAction::DeleteLineLeft)
+                }
+                _ if event_matches_char(key, modified_key, "d") && modifiers.shift() => {
+                    Some(ShortcutAction::SplitVertical)
+                }
+                _ if event_matches_char(key, modified_key, "t")
+                    || event_matches_char(key, modified_key, "n") =>
+                {
+                    Some(ShortcutAction::NewTab)
+                }
+                _ if event_matches_char(key, modified_key, "d") => {
+                    Some(ShortcutAction::ToggleSplit)
+                }
+                _ if event_matches_char(key, modified_key, "w") => {
+                    Some(ShortcutAction::ClosePaneOrTab)
+                }
+                _ if event_matches_char(key, modified_key, "k")
+                    || event_matches_char(key, modified_key, "r") =>
+                {
+                    Some(ShortcutAction::ClearTerminal)
+                }
+                _ if event_matches_char(key, modified_key, "b") => {
+                    Some(ShortcutAction::ToggleSidebar)
+                }
+                _ if event_matches_char(key, modified_key, "q") => Some(ShortcutAction::Quit),
+                _ if event_matches_char(key, modified_key, "[")
+                    || event_matches_char(key, modified_key, "{") =>
+                {
+                    Some(ShortcutAction::SwitchTab(-1))
+                }
+                _ if event_matches_char(key, modified_key, "]")
+                    || event_matches_char(key, modified_key, "}") =>
+                {
+                    Some(ShortcutAction::SwitchTab(1))
+                }
+                _ => {
+                    let digit = match key {
+                        keyboard::Key::Character(value) => value.chars().next(),
+                        _ => None,
+                    }
+                    .and_then(|ch| ch.to_digit(10))
+                    .filter(|digit| (1..=9).contains(digit));
 
-                digit.map(|digit| ShortcutAction::SelectTab((digit - 1) as usize))
+                    digit.map(|digit| ShortcutAction::SelectTab((digit - 1) as usize))
+                }
             }
         }
     } else if modifiers.alt() {
@@ -457,6 +464,8 @@ fn shortcut_action(
             }
             _ => None,
         }
+    } else if modifiers.is_empty() && is_forward_delete_key(event) {
+        Some(ShortcutAction::DeleteForward)
     } else {
         None
     };
@@ -477,13 +486,19 @@ fn should_capture_terminal_shortcut(
 fn should_listen_to_keyboard_event(event: &keyboard::Event) -> bool {
     match event {
         keyboard::Event::ModifiersChanged(_) => true,
-        keyboard::Event::KeyPressed {
-            key, modified_key, ..
-        }
-        | keyboard::Event::KeyReleased {
-            key, modified_key, ..
-        } => {
+        keyboard::Event::KeyPressed { .. } | keyboard::Event::KeyReleased { .. } => {
+            let (key, modified_key) = match event {
+                keyboard::Event::KeyPressed {
+                    key, modified_key, ..
+                }
+                | keyboard::Event::KeyReleased {
+                    key, modified_key, ..
+                } => (key, modified_key),
+                keyboard::Event::ModifiersChanged(_) => unreachable!(),
+            };
+
             is_modifier_key(key)
+                || is_forward_delete_key(event)
                 || matches!(
                     key,
                     keyboard::Key::Named(
@@ -505,6 +520,24 @@ fn should_listen_to_keyboard_event(event: &keyboard::Event) -> bool {
                         if value.chars().next().is_some_and(|ch| ('1'..='9').contains(&ch))
                 )
         }
+    }
+}
+
+fn is_forward_delete_key(event: &keyboard::Event) -> bool {
+    match event {
+        keyboard::Event::KeyPressed {
+            key, physical_key, ..
+        }
+        | keyboard::Event::KeyReleased {
+            key, physical_key, ..
+        } => {
+            matches!(key, keyboard::Key::Named(keyboard::key::Named::Delete))
+                || matches!(
+                    physical_key,
+                    keyboard::key::Physical::Code(keyboard::key::Code::Delete)
+                )
+        }
+        keyboard::Event::ModifiersChanged(_) => false,
     }
 }
 
@@ -686,9 +719,26 @@ pub struct State {
     pub collapsed_groups: std::collections::HashMap<String, bool>,
     pub agent_states: std::collections::HashMap<String, agent_state::AgentExternalState>,
     agent_state_dir: std::path::PathBuf,
-    /// None = not yet attempted, Some(true) = applied, Some(false) = unavailable
     #[cfg(target_os = "macos")]
-    vibrancy_state: Option<bool>,
+    vibrancy_state: SidebarVibrancyState,
+    #[cfg(target_os = "macos")]
+    vibrancy_view: Option<*mut objc2::runtime::AnyObject>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidebarVibrancyState {
+    Pending,
+    Active,
+    Unsupported,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidebarVibrancySync {
+    Deferred,
+    Active,
+    Unsupported,
 }
 
 impl State {
@@ -722,7 +772,9 @@ impl State {
             agent_states: std::collections::HashMap::new(),
             agent_state_dir: agent_state::state_dir(),
             #[cfg(target_os = "macos")]
-            vibrancy_state: None,
+            vibrancy_state: SidebarVibrancyState::Pending,
+            #[cfg(target_os = "macos")]
+            vibrancy_view: None,
         };
 
         state.sync_test_state();
@@ -1012,29 +1064,48 @@ impl State {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn refresh_sidebar_vibrancy(&mut self) {
+        if self.vibrancy_state == SidebarVibrancyState::Unsupported {
+            return;
+        }
+        // Skip redundant ObjC calls when already active — ToggleSidebar and
+        // ConfigReloaded reset state to Pending to force a refresh.
+        if self.vibrancy_state == SidebarVibrancyState::Active {
+            return;
+        }
+
+        let sidebar_w = self.config.ui.sidebar_width;
+        let sidebar_visible = self.sidebar_visible;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            apply_sidebar_vibrancy(sidebar_w, sidebar_visible, &mut self.vibrancy_view)
+        }));
+        self.vibrancy_state = match result {
+            Ok(SidebarVibrancySync::Active) => SidebarVibrancyState::Active,
+            Ok(SidebarVibrancySync::Deferred) => self.vibrancy_state,
+            Ok(SidebarVibrancySync::Unsupported) => SidebarVibrancyState::Unsupported,
+            Err(_) => {
+                eprintln!("[vibrancy] panic during init — disabling vibrancy");
+                SidebarVibrancyState::Unsupported
+            }
+        };
+    }
+
     // ── Update ───────────────────────────────────────────────────────────────
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         // Apply sidebar vibrancy on first update — window exists, on main thread.
-        // We insert an NSVisualEffectView behind the Metal layer covering only the
-        // sidebar area. win.transparent=true is required so the Metal layer renders
-        // transparent pixels in the sidebar, letting the NSVisualEffectView show.
+        // We insert/update an NSVisualEffectView behind the Metal layer covering
+        // only the sidebar area. win.transparent=true is required so the Metal
+        // layer renders transparent pixels in the sidebar, letting the native
+        // vibrancy view show through.
         //
         // SAFETY: this runs inside the winit event handler which is an ObjC block
         // (extern "C"). Any Rust panic here becomes panic_cannot_unwind → abort().
         // catch_unwind ensures that ObjC/class-lookup failures disable vibrancy
         // gracefully instead of crashing the process.
         #[cfg(target_os = "macos")]
-        if self.vibrancy_state.is_none() {
-            let sidebar_w = self.config.ui.sidebar_width;
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                apply_sidebar_vibrancy(sidebar_w)
-            }));
-            self.vibrancy_state = Some(result.unwrap_or_else(|_| {
-                eprintln!("[vibrancy] panic during init — disabling vibrancy");
-                false
-            }));
-        }
+        self.refresh_sidebar_vibrancy();
 
         let task = match message {
             Message::KeyboardEvent(event) => {
@@ -1382,9 +1453,26 @@ impl State {
                 if let Some(slot_idx) = self.active_slot_idx() {
                     if let Some(slot) = self.slots.get_mut(slot_idx) {
                         if let Some(ref mut terminal) = slot.terminal {
-                            // Send "clear" command: Ctrl+L (form feed)
                             let cmd = iced_term::Command::ProxyToBackend(
-                                iced_term::backend::Command::Write(vec![0x0c]),
+                                iced_term::backend::Command::Write(
+                                    CLEAR_TERMINAL_SEQUENCE.to_vec(),
+                                ),
+                            );
+                            terminal.handle(cmd);
+                        }
+                    }
+                }
+                Task::none()
+            }
+
+            Message::DeleteForward => {
+                if let Some(slot_idx) = self.active_slot_idx() {
+                    if let Some(slot) = self.slots.get_mut(slot_idx) {
+                        if let Some(ref mut terminal) = slot.terminal {
+                            let cmd = iced_term::Command::ProxyToBackend(
+                                iced_term::backend::Command::Write(
+                                    FORWARD_DELETE_SEQUENCE.to_vec(),
+                                ),
                             );
                             terminal.handle(cmd);
                         }
@@ -1481,6 +1569,11 @@ impl State {
 
             Message::ToggleSidebar => {
                 self.sidebar_visible = !self.sidebar_visible;
+                #[cfg(target_os = "macos")]
+                {
+                    self.vibrancy_state = SidebarVibrancyState::Pending;
+                    self.refresh_sidebar_vibrancy();
+                }
                 // Re-focus current terminal
                 if let Some(term) = self
                     .active_slot_idx()
@@ -1540,6 +1633,11 @@ impl State {
                     new_config.groups.len()
                 );
                 self.config = new_config;
+                #[cfg(target_os = "macos")]
+                {
+                    self.vibrancy_state = SidebarVibrancyState::Pending;
+                    self.refresh_sidebar_vibrancy();
+                }
                 Task::none()
             }
 
@@ -1726,7 +1824,7 @@ impl State {
         // When vibrancy is active the Iced sidebar container must be transparent
         // so the NSVisualEffectView behind the Metal layer shows through.
         #[cfg(target_os = "macos")]
-        let sidebar_transparent = self.vibrancy_state == Some(true);
+        let sidebar_transparent = self.vibrancy_state == SidebarVibrancyState::Active;
         #[cfg(not(target_os = "macos"))]
         let sidebar_transparent = false;
         let sidebar_width = self.config.ui.sidebar_width;
@@ -2126,11 +2224,11 @@ impl State {
 
 // ── macOS Sidebar Vibrancy ───────────────────────────────────────────────────
 //
-// Strategy: Insert an NSVisualEffectView at index 0 (behind the Metal layer)
-// covering only the sidebar region. Because win.transparent=true is set, Iced
-// renders transparent pixels wherever the sidebar container has background=None,
-// allowing the NSVisualEffectView to composite with what's behind the window.
-// The terminal area always draws opaque pixels, preventing grey bleed there.
+// Strategy: Keep winit's WinitView as NSWindow.contentView and insert an
+// NSVisualEffectView as a sibling underneath it in the frame view. Because
+// win.transparent=true is set, Iced renders transparent pixels wherever the
+// sidebar container has background=None, allowing the NSVisualEffectView to
+// show through while the terminal area remains opaque.
 
 /// Returns the macOS major version (e.g. 15 for Sequoia), or 0 on failure.
 #[cfg(target_os = "macos")]
@@ -2163,63 +2261,77 @@ const NS_VISUAL_EFFECT_MATERIAL_SIDEBAR: i64 = 7;
 const NS_VISUAL_EFFECT_STATE_ACTIVE: i64 = 1;
 // NSVisualEffectBlendingMode.behindWindow = 0
 const NS_VISUAL_EFFECT_BLENDING_BEHIND_WINDOW: i64 = 0;
-// NSViewHeightSizable (1 << 4 = 16): auto-resize height with superview
-const NS_VIEW_HEIGHT_SIZABLE: usize = 16;
 
 /// Insert an NSVisualEffectView covering `sidebar_width` pixels on the left
-/// behind Iced's Metal layer. Returns `true` on success.
+/// behind Iced's Metal layer. Keeps WinitView as `contentView`.
 ///
-/// Requires macOS 15+ (Sequoia). Gracefully returns `false` on older systems.
+/// Requires macOS 15+ (Sequoia). Returns `Deferred` until a live window exists.
 #[cfg(target_os = "macos")]
-fn apply_sidebar_vibrancy(sidebar_width: f32) -> bool {
+fn apply_sidebar_vibrancy(
+    sidebar_width: f32,
+    sidebar_visible: bool,
+    vibrancy_view: &mut Option<*mut objc2::runtime::AnyObject>,
+) -> SidebarVibrancySync {
     use objc2::rc::autoreleasepool;
     use objc2::runtime::AnyObject;
     use objc2::{class, msg_send, MainThreadMarker};
-    use objc2_app_kit::NSApplication;
-    use objc2_foundation::{NSPoint, NSRect, NSSize};
+    use objc2_app_kit::{NSApplication, NSAutoresizingMaskOptions};
+    use objc2_foundation::{NSRect, NSSize};
 
     let major = macos_major_version();
     if major < 15 {
         eprintln!("[vibrancy] macOS 15+ required (found {major}.x), skipping");
-        return false;
+        return SidebarVibrancySync::Unsupported;
     }
 
     let Some(mtm) = MainThreadMarker::new() else {
-        eprintln!("[vibrancy] must be called from main thread");
-        return false;
+        return SidebarVibrancySync::Deferred;
     };
 
-    let mut applied = false;
+    let mut result = SidebarVibrancySync::Deferred;
 
     autoreleasepool(|_pool| {
         let app = NSApplication::sharedApplication(mtm);
 
-        let Some(window) = app.keyWindow() else {
-            eprintln!("[vibrancy] no key window");
+        let window = app.keyWindow().or_else(|| app.mainWindow());
+        let Some(window) = window else {
             return;
         };
         let Some(content_view) = window.contentView() else {
-            eprintln!("[vibrancy] no content view");
+            return;
+        };
+        let Some(frame_view) = (unsafe { content_view.superview() }) else {
             return;
         };
 
-        // Content-view height for the NSVisualEffectView frame.
-        let bounds: NSRect = unsafe { msg_send![&*content_view, bounds] };
-        let height = bounds.size.height;
+        const NS_WINDOW_BELOW: isize = -1;
 
-        // ── Create NSVisualEffectView ────────────────────────────────────────
-        let vev_cls = class!(NSVisualEffectView);
-        let vev_alloc: *mut AnyObject = unsafe { msg_send![vev_cls, alloc] };
+        let content_frame = content_view.frame();
         let sidebar_frame = NSRect {
-            origin: NSPoint { x: 0.0, y: 0.0 },
+            origin: content_frame.origin,
             size: NSSize {
-                width: sidebar_width as f64,
-                height,
+                width: sidebar_width.max(0.0) as f64,
+                height: content_frame.size.height,
             },
         };
+        let autoresizing_mask = NSAutoresizingMaskOptions::ViewHeightSizable
+            | NSAutoresizingMaskOptions::ViewMaxXMargin;
+        let vev_hidden = !sidebar_visible || sidebar_width <= 0.0;
+
+        if let Some(existing_vev) = *vibrancy_view {
+            let _: () = unsafe { msg_send![existing_vev, setFrame: sidebar_frame] };
+            let _: () = unsafe { msg_send![existing_vev, setAutoresizingMask: autoresizing_mask] };
+            let _: () = unsafe { msg_send![existing_vev, setHidden: vev_hidden] };
+            result = SidebarVibrancySync::Active;
+            return;
+        }
+
+        let vev_cls = class!(NSVisualEffectView);
+        let vev_alloc: *mut AnyObject = unsafe { msg_send![vev_cls, alloc] };
         let vev: *mut AnyObject = unsafe { msg_send![vev_alloc, initWithFrame: sidebar_frame] };
         if vev.is_null() {
             eprintln!("[vibrancy] NSVisualEffectView init failed");
+            result = SidebarVibrancySync::Unsupported;
             return;
         }
 
@@ -2227,28 +2339,26 @@ fn apply_sidebar_vibrancy(sidebar_width: f32) -> bool {
         let _: () = unsafe { msg_send![vev, setState: NS_VISUAL_EFFECT_STATE_ACTIVE] };
         let _: () =
             unsafe { msg_send![vev, setBlendingMode: NS_VISUAL_EFFECT_BLENDING_BEHIND_WINDOW] };
-        // NSViewHeightSizable: auto-resize height with superview so the effect
-        // covers the full sidebar on window resize.
-        let _: () = unsafe { msg_send![vev, setAutoresizingMask: NS_VIEW_HEIGHT_SIZABLE] };
+        let _: () = unsafe { msg_send![vev, setAutoresizingMask: autoresizing_mask] };
+        let _: () = unsafe { msg_send![vev, setHidden: vev_hidden] };
+        let _: () = unsafe {
+            msg_send![&*frame_view, addSubview: vev, positioned: NS_WINDOW_BELOW, relativeTo: Some(&*content_view)]
+        };
+        *vibrancy_view = Some(vev);
+        let _: () = unsafe { msg_send![vev, release] };
 
-        // ── Insert behind all existing subviews (index 0 = back of Z-order) ─
-        let _: () = unsafe { msg_send![&*content_view, insertSubview: vev, atIndex: 0usize] };
+        window.setInitialFirstResponder(Some(&content_view));
+        let _ = window.makeFirstResponder(Some(&content_view));
 
-        // ── Make window non-opaque so vibrancy composites with the desktop ──
-        let _: () = unsafe { msg_send![&*window, setOpaque: false] };
-        // Clear background colour so the window compositor uses per-pixel alpha.
-        let ns_color_cls = class!(NSColor);
-        let clear_color: *mut AnyObject = unsafe { msg_send![ns_color_cls, clearColor] };
-        let _: () = unsafe { msg_send![&*window, setBackgroundColor: clear_color] };
-
-        eprintln!("[vibrancy] sidebar NSVisualEffectView applied ({sidebar_width}px × {height})");
-        applied = true;
+        eprintln!(
+            "[vibrancy] installed sibling VEV under WinitView ({sidebar_width}px x {})",
+            content_frame.size.height
+        );
+        result = SidebarVibrancySync::Active;
     });
 
-    applied
+    result
 }
-
-// ── Run ──────────────────────────────────────────────────────────────────────
 
 pub fn run(cmd: Vec<String>) -> anyhow::Result<()> {
     // Remove CLAUDECODE env var so child terminals can launch Claude Code
@@ -2264,10 +2374,8 @@ pub fn run(cmd: Vec<String>) -> anyhow::Result<()> {
         win.platform_specific.title_hidden = true;
         win.platform_specific.titlebar_transparent = true;
         win.platform_specific.fullsize_content_view = true;
-        // Required for sidebar-only vibrancy: Iced must render transparent pixels in
-        // the sidebar area so the NSVisualEffectView behind the Metal layer shows
-        // through. Grey bleed is prevented by the opaque terminal_bg on content_area
-        // and by the NSVisualEffectView providing visual fill for the sidebar.
+        // Required for sidebar vibrancy: transparent Metal pixels in the sidebar
+        // area let the NSVisualEffectView show through.
         win.transparent = true;
     }
 
@@ -2281,7 +2389,21 @@ pub fn run(cmd: Vec<String>) -> anyhow::Result<()> {
         State::view,
     )
     .subscription(State::subscription)
-    .theme(|_: &State| iced::Theme::Dark)
+    .theme(|state: &State| {
+        #[cfg(target_os = "macos")]
+        if state.vibrancy_state == SidebarVibrancyState::Active {
+            // Use a custom Dark theme with transparent background so the Metal
+            // clear pass leaves alpha=0 pixels where no widget draws.  The
+            // NSVisualEffectView behind the Metal layer shows through those
+            // transparent regions (the sidebar).  Terminal panes and content
+            // area draw their own opaque backgrounds.
+            let mut custom = iced::Theme::Dark.palette();
+            custom.background = iced::Color::TRANSPARENT;
+            return iced::Theme::custom("Dark Vibrancy".to_string(), custom);
+        }
+        let _ = state; // suppress unused warning on non-macOS
+        iced::Theme::Dark
+    })
     .title("Golem Terminal")
     .window(win)
     .run()
@@ -2766,6 +2888,37 @@ mod tests {
         assert_eq!(
             shortcut_action(&cmd_shift_bracket, keyboard::Modifiers::empty()),
             Some(ShortcutAction::SwitchTab(-1))
+        );
+    }
+
+    #[test]
+    fn shortcut_action_maps_physical_forward_delete() {
+        let delete = key_pressed(
+            keyboard::Key::Character(" ".into()),
+            keyboard::Key::Character(" ".into()),
+            keyboard::key::Physical::Code(keyboard::key::Code::Delete),
+            keyboard::Modifiers::empty(),
+        );
+
+        assert!(should_listen_to_keyboard_event(&delete));
+        assert_eq!(
+            shortcut_action(&delete, keyboard::Modifiers::empty()),
+            Some(ShortcutAction::DeleteForward)
+        );
+    }
+
+    #[test]
+    fn shortcut_action_maps_command_forward_delete_to_delete_line_left() {
+        let cmd_delete = key_pressed(
+            keyboard::Key::Character(" ".into()),
+            keyboard::Key::Character(" ".into()),
+            keyboard::key::Physical::Code(keyboard::key::Code::Delete),
+            keyboard::Modifiers::COMMAND,
+        );
+
+        assert_eq!(
+            shortcut_action(&cmd_delete, keyboard::Modifiers::empty()),
+            Some(ShortcutAction::DeleteLineLeft)
         );
     }
 }
