@@ -73,7 +73,6 @@ pub enum Message {
     ClosePaneOrTab,
     ClearTerminal,
     DeleteLineLeft,
-    DeleteLineRight,
     OptionDeleteWord,
 
     // Window
@@ -297,7 +296,6 @@ enum ShortcutAction {
     ClosePaneOrTab,
     ClearTerminal,
     DeleteLineLeft,
-    DeleteLineRight,
     DeleteWordLeft,
     ToggleSidebar,
     Quit,
@@ -318,7 +316,6 @@ impl ShortcutAction {
             Self::ClosePaneOrTab => Message::ClosePaneOrTab,
             Self::ClearTerminal => Message::ClearTerminal,
             Self::DeleteLineLeft => Message::DeleteLineLeft,
-            Self::DeleteLineRight => Message::DeleteLineRight,
             Self::DeleteWordLeft => Message::OptionDeleteWord,
             Self::ToggleSidebar => Message::ToggleSidebar,
             Self::Quit => Message::Quit,
@@ -406,7 +403,10 @@ fn shortcut_action(
             keyboard::Key::Named(keyboard::key::Named::Delete)
                 if !modifiers.alt() && !modifiers.control() =>
             {
-                Some(ShortcutAction::DeleteLineRight)
+                // Cmd+Delete (forward-delete key) mirrors Cmd+Backspace: both
+                // map to "delete to line start" (Ctrl+U), matching macOS
+                // system-wide Cmd+Delete behaviour in text fields.
+                Some(ShortcutAction::DeleteLineLeft)
             }
             _ if event_matches_char(key, modified_key, "d") && modifiers.shift() => {
                 Some(ShortcutAction::SplitVertical)
@@ -607,6 +607,12 @@ fn capture_terminal_shortcuts<'a>(
             viewport: &iced::Rectangle,
             renderer: &iced::Renderer,
         ) -> mouse::Interaction {
+            // Guard: if the cursor is outside the terminal bounds, return the
+            // default interaction so the cursor icon resets when the mouse
+            // moves to the sidebar or other non-terminal areas.
+            if !cursor.is_over(layout.bounds()) {
+                return mouse::Interaction::default();
+            }
             self.content.as_widget().mouse_interaction(
                 &tree.children[0],
                 layout,
@@ -676,8 +682,9 @@ pub struct State {
     pub collapsed_groups: std::collections::HashMap<String, bool>,
     pub agent_states: std::collections::HashMap<String, agent_state::AgentExternalState>,
     agent_state_dir: std::path::PathBuf,
+    /// None = not yet attempted, Some(true) = applied, Some(false) = unavailable
     #[cfg(target_os = "macos")]
-    vibrancy_applied: bool,
+    vibrancy_state: Option<bool>,
 }
 
 impl State {
@@ -711,7 +718,7 @@ impl State {
             agent_states: std::collections::HashMap::new(),
             agent_state_dir: agent_state::state_dir(),
             #[cfg(target_os = "macos")]
-            vibrancy_applied: false,
+            vibrancy_state: None,
         };
 
         state.sync_test_state();
@@ -992,15 +999,14 @@ impl State {
     // ── Update ───────────────────────────────────────────────────────────────
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
-        // Apply vibrancy on first update (window now exists, we're on main thread)
-        // DISABLED: vibrancy applies to entire content view, making terminal grey.
-        // Needs per-subview vibrancy (sidebar only) — Phase 2 task.
+        // Apply sidebar vibrancy on first update — window exists, on main thread.
+        // We insert an NSVisualEffectView behind the Metal layer covering only the
+        // sidebar area. win.transparent=true is required so the Metal layer renders
+        // transparent pixels in the sidebar, letting the NSVisualEffectView show.
         #[cfg(target_os = "macos")]
-        if !self.vibrancy_applied {
-            self.vibrancy_applied = true;
-            // if objc2::MainThreadMarker::new().is_some() {
-            //     apply_macos_vibrancy();
-            // }
+        if self.vibrancy_state.is_none() {
+            let sidebar_w = self.config.ui.sidebar_width;
+            self.vibrancy_state = Some(apply_sidebar_vibrancy(sidebar_w));
         }
 
         let task = match message {
@@ -1375,20 +1381,6 @@ impl State {
                 Task::none()
             }
 
-            Message::DeleteLineRight => {
-                if let Some(slot_idx) = self.active_slot_idx() {
-                    if let Some(slot) = self.slots.get_mut(slot_idx) {
-                        if let Some(ref mut terminal) = slot.terminal {
-                            let cmd = iced_term::Command::ProxyToBackend(
-                                iced_term::backend::Command::Write(vec![0x0b]), // Ctrl+K
-                            );
-                            terminal.handle(cmd);
-                        }
-                    }
-                }
-                Task::none()
-            }
-
             Message::OptionDeleteWord => {
                 // Send ESC+DEL (Option+Backspace word delete) to focused terminal
                 if let Some(slot_idx) = self.active_slot_idx() {
@@ -1569,6 +1561,9 @@ impl State {
         let focus = self.focus;
         let focus_border_color = parse_hex_color(&self.config.ui.colors.focus_border);
         let pane_spacing = self.config.ui.pane_spacing;
+        // Opaque background for the terminal area — prevents grey bleed when
+        // win.transparent=true is used for sidebar vibrancy.
+        let terminal_bg = parse_hex_color(ITERM_BACKGROUND);
 
         let pane_grid_widget = PaneGrid::new(&self.panes, |pane_id, &slot_idx, _is_maximized| {
             let is_focused = focus == Some(pane_id);
@@ -1600,6 +1595,10 @@ impl State {
         let content_area: iced::Element<'_, Message> = container(pane_grid_widget)
             .width(Length::Fill)
             .height(Length::Fill)
+            .style(move |_theme| container::Style {
+                background: Some(iced::Background::Color(terminal_bg)),
+                ..Default::default()
+            })
             .into();
 
         if self.sidebar_visible {
@@ -1697,6 +1696,12 @@ impl State {
         let accent_color = parse_hex_color(&colors.accent);
         let focus_border = parse_hex_color(&colors.focus_border);
         let bg_sidebar = parse_hex_color_alpha(&colors.bg_sidebar, 0.7);
+        // When vibrancy is active the Iced sidebar container must be transparent
+        // so the NSVisualEffectView behind the Metal layer shows through.
+        #[cfg(target_os = "macos")]
+        let sidebar_transparent = self.vibrancy_state == Some(true);
+        #[cfg(not(target_os = "macos"))]
+        let sidebar_transparent = false;
         let sidebar_width = self.config.ui.sidebar_width;
         let font_group = font.group;
         let font_tab = font.tab;
@@ -2007,7 +2012,11 @@ impl State {
 
         container(sidebar_content)
             .style(move |_theme| container::Style {
-                background: Some(iced::Background::Color(bg_sidebar)),
+                background: if sidebar_transparent {
+                    None // transparent: NSVisualEffectView composites behind Metal layer
+                } else {
+                    Some(iced::Background::Color(bg_sidebar))
+                },
                 ..Default::default()
             })
             .width(sidebar_width)
@@ -2052,59 +2061,128 @@ impl State {
     }
 }
 
-// ── macOS Vibrancy ───────────────────────────────────────────────────────────
+// ── macOS Sidebar Vibrancy ───────────────────────────────────────────────────
+//
+// Strategy: Insert an NSVisualEffectView at index 0 (behind the Metal layer)
+// covering only the sidebar region. Because win.transparent=true is set, Iced
+// renders transparent pixels wherever the sidebar container has background=None,
+// allowing the NSVisualEffectView to composite with what's behind the window.
+// The terminal area always draws opaque pixels, preventing grey bleed there.
 
+/// Returns the macOS major version (e.g. 15 for Sequoia), or 0 on failure.
 #[cfg(target_os = "macos")]
-fn apply_macos_vibrancy() {
-    use objc2::rc::Retained;
-    use objc2::MainThreadMarker;
+fn macos_major_version() -> u32 {
+    let mut buf = [0u8; 32];
+    let mut len = buf.len();
+    let ret = unsafe {
+        libc::sysctlbyname(
+            b"kern.osproductversion\0".as_ptr() as *const libc::c_char,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ret != 0 {
+        return 0;
+    }
+    // The string is NUL-terminated; trim the NUL before parsing.
+    let s = std::str::from_utf8(&buf[..len.saturating_sub(1)]).unwrap_or("0");
+    s.split('.')
+        .next()
+        .and_then(|m| m.parse().ok())
+        .unwrap_or(0)
+}
+
+// NSVisualEffectMaterial.sidebar = 7 (macOS 10.14+)
+const NS_VISUAL_EFFECT_MATERIAL_SIDEBAR: i64 = 7;
+// NSVisualEffectState.active = 1
+const NS_VISUAL_EFFECT_STATE_ACTIVE: i64 = 1;
+// NSVisualEffectBlendingMode.behindWindow = 0
+const NS_VISUAL_EFFECT_BLENDING_BEHIND_WINDOW: i64 = 0;
+// NSViewHeightSizable (1 << 4 = 16): auto-resize height with superview
+const NS_VIEW_HEIGHT_SIZABLE: usize = 16;
+
+/// Insert an NSVisualEffectView covering `sidebar_width` pixels on the left
+/// behind Iced's Metal layer. Returns `true` on success.
+///
+/// Requires macOS 15+ (Sequoia). Gracefully returns `false` on older systems.
+#[cfg(target_os = "macos")]
+fn apply_sidebar_vibrancy(sidebar_width: f32) -> bool {
+    use objc2::rc::autoreleasepool;
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send, MainThreadMarker};
     use objc2_app_kit::NSApplication;
-    use std::ptr::NonNull;
+    use objc2_foundation::{NSPoint, NSRect, NSSize};
 
-    // This must be called from the main thread (Iced's update runs on main)
-    let mtm =
-        MainThreadMarker::new().expect("apply_macos_vibrancy must be called from main thread");
-
-    let app = NSApplication::sharedApplication(mtm);
-    let Some(window) = (unsafe { app.keyWindow() }) else {
-        eprintln!("[vibrancy] no key window found");
-        return;
-    };
-
-    let Some(content_view) = (unsafe { window.contentView() }) else {
-        eprintln!("[vibrancy] no content view");
-        return;
-    };
-
-    // Wrap the NSView pointer for window-vibrancy
-    let ns_view_ptr = Retained::as_ptr(&content_view) as *mut std::ffi::c_void;
-
-    struct NsViewHandle(NonNull<std::ffi::c_void>);
-
-    impl iced::window::raw_window_handle::HasWindowHandle for NsViewHandle {
-        fn window_handle(
-            &self,
-        ) -> Result<
-            iced::window::raw_window_handle::WindowHandle<'_>,
-            iced::window::raw_window_handle::HandleError,
-        > {
-            let handle = iced::window::raw_window_handle::AppKitWindowHandle::new(self.0);
-            Ok(unsafe { iced::window::raw_window_handle::WindowHandle::borrow_raw(handle.into()) })
-        }
+    let major = macos_major_version();
+    if major < 15 {
+        eprintln!("[vibrancy] macOS 15+ required (found {major}.x), skipping");
+        return false;
     }
 
-    if let Some(ptr) = NonNull::new(ns_view_ptr) {
-        let handle = NsViewHandle(ptr);
-        match window_vibrancy::apply_vibrancy(
-            &handle,
-            window_vibrancy::NSVisualEffectMaterial::Sidebar,
-            Some(window_vibrancy::NSVisualEffectState::Active),
-            None,
-        ) {
-            Ok(()) => eprintln!("[vibrancy] applied Sidebar material"),
-            Err(e) => eprintln!("[vibrancy] failed: {e}"),
+    let Some(mtm) = MainThreadMarker::new() else {
+        eprintln!("[vibrancy] must be called from main thread");
+        return false;
+    };
+
+    let mut applied = false;
+
+    autoreleasepool(|_pool| {
+        let app = NSApplication::sharedApplication(mtm);
+
+        let Some(window) = app.keyWindow() else {
+            eprintln!("[vibrancy] no key window");
+            return;
+        };
+        let Some(content_view) = window.contentView() else {
+            eprintln!("[vibrancy] no content view");
+            return;
+        };
+
+        // Content-view height for the NSVisualEffectView frame.
+        let bounds: NSRect = unsafe { msg_send![&*content_view, bounds] };
+        let height = bounds.size.height;
+
+        // ── Create NSVisualEffectView ────────────────────────────────────────
+        let vev_cls = class!(NSVisualEffectView);
+        let vev_alloc: *mut AnyObject = unsafe { msg_send![vev_cls, alloc] };
+        let sidebar_frame = NSRect {
+            origin: NSPoint { x: 0.0, y: 0.0 },
+            size: NSSize {
+                width: sidebar_width as f64,
+                height,
+            },
+        };
+        let vev: *mut AnyObject = unsafe { msg_send![vev_alloc, initWithFrame: sidebar_frame] };
+        if vev.is_null() {
+            eprintln!("[vibrancy] NSVisualEffectView init failed");
+            return;
         }
-    }
+
+        let _: () = unsafe { msg_send![vev, setMaterial: NS_VISUAL_EFFECT_MATERIAL_SIDEBAR] };
+        let _: () = unsafe { msg_send![vev, setState: NS_VISUAL_EFFECT_STATE_ACTIVE] };
+        let _: () =
+            unsafe { msg_send![vev, setBlendingMode: NS_VISUAL_EFFECT_BLENDING_BEHIND_WINDOW] };
+        // NSViewHeightSizable: auto-resize height with superview so the effect
+        // covers the full sidebar on window resize.
+        let _: () = unsafe { msg_send![vev, setAutoresizingMask: NS_VIEW_HEIGHT_SIZABLE] };
+
+        // ── Insert behind all existing subviews (index 0 = back of Z-order) ─
+        let _: () = unsafe { msg_send![&*content_view, insertSubview: vev, atIndex: 0usize] };
+
+        // ── Make window non-opaque so vibrancy composites with the desktop ──
+        let _: () = unsafe { msg_send![&*window, setOpaque: false] };
+        // Clear background colour so the window compositor uses per-pixel alpha.
+        let ns_color_cls = class!(NSColor);
+        let clear_color: *mut AnyObject = unsafe { msg_send![ns_color_cls, clearColor] };
+        let _: () = unsafe { msg_send![&*window, setBackgroundColor: clear_color] };
+
+        eprintln!("[vibrancy] sidebar NSVisualEffectView applied ({sidebar_width}px × {height})");
+        applied = true;
+    });
+
+    applied
 }
 
 // ── Run ──────────────────────────────────────────────────────────────────────
@@ -2123,7 +2201,11 @@ pub fn run(cmd: Vec<String>) -> anyhow::Result<()> {
         win.platform_specific.title_hidden = true;
         win.platform_specific.titlebar_transparent = true;
         win.platform_specific.fullsize_content_view = true;
-        // win.transparent = true; // TEMPORARILY DISABLED for debugging
+        // Required for sidebar-only vibrancy: Iced must render transparent pixels in
+        // the sidebar area so the NSVisualEffectView behind the Metal layer shows
+        // through. Grey bleed is prevented by the opaque terminal_bg on content_area
+        // and by the NSVisualEffectView providing visual fill for the sidebar.
+        win.transparent = true;
     }
 
     iced::application(
