@@ -73,7 +73,6 @@ pub enum Message {
     ClosePaneOrTab,
     ClearTerminal,
     DeleteLineLeft,
-    DeleteLineRight,
     OptionDeleteWord,
 
     // Window
@@ -1382,20 +1381,6 @@ impl State {
                 Task::none()
             }
 
-            Message::DeleteLineRight => {
-                if let Some(slot_idx) = self.active_slot_idx() {
-                    if let Some(slot) = self.slots.get_mut(slot_idx) {
-                        if let Some(ref mut terminal) = slot.terminal {
-                            let cmd = iced_term::Command::ProxyToBackend(
-                                iced_term::backend::Command::Write(vec![0x0b]), // Ctrl+K
-                            );
-                            terminal.handle(cmd);
-                        }
-                    }
-                }
-                Task::none()
-            }
-
             Message::OptionDeleteWord => {
                 // Send ESC+DEL (Option+Backspace word delete) to focused terminal
                 if let Some(slot_idx) = self.active_slot_idx() {
@@ -2089,14 +2074,17 @@ impl State {
 fn macos_major_version() -> u32 {
     let mut buf = [0u8; 32];
     let mut len = buf.len();
-    unsafe {
+    let ret = unsafe {
         libc::sysctlbyname(
             b"kern.osproductversion\0".as_ptr() as *const libc::c_char,
             buf.as_mut_ptr() as *mut libc::c_void,
             &mut len,
             std::ptr::null_mut(),
             0,
-        );
+        )
+    };
+    if ret != 0 {
+        return 0;
     }
     // The string is NUL-terminated; trim the NUL before parsing.
     let s = std::str::from_utf8(&buf[..len.saturating_sub(1)]).unwrap_or("0");
@@ -2105,6 +2093,15 @@ fn macos_major_version() -> u32 {
         .and_then(|m| m.parse().ok())
         .unwrap_or(0)
 }
+
+// NSVisualEffectMaterial.sidebar = 7 (macOS 10.14+)
+const NS_VISUAL_EFFECT_MATERIAL_SIDEBAR: i64 = 7;
+// NSVisualEffectState.active = 1
+const NS_VISUAL_EFFECT_STATE_ACTIVE: i64 = 1;
+// NSVisualEffectBlendingMode.behindWindow = 0
+const NS_VISUAL_EFFECT_BLENDING_BEHIND_WINDOW: i64 = 0;
+// NSViewHeightSizable (1 << 4 = 16): auto-resize height with superview
+const NS_VIEW_HEIGHT_SIZABLE: usize = 16;
 
 /// Insert an NSVisualEffectView covering `sidebar_width` pixels on the left
 /// behind Iced's Metal layer. Returns `true` on success.
@@ -2163,15 +2160,13 @@ fn apply_sidebar_vibrancy(sidebar_width: f32) -> bool {
             return;
         }
 
-        // NSVisualEffectMaterial.sidebar = 7  (available macOS 10.14+)
-        let _: () = unsafe { msg_send![vev, setMaterial: 7i64] };
-        // NSVisualEffectState.active = 1
-        let _: () = unsafe { msg_send![vev, setState: 1i64] };
-        // NSVisualEffectBlendingMode.behindWindow = 0
-        let _: () = unsafe { msg_send![vev, setBlendingMode: 0i64] };
-        // NSViewHeightSizable (1 << 4 = 16): auto-resize height with superview
-        // so the effect covers the full sidebar on window resize.
-        let _: () = unsafe { msg_send![vev, setAutoresizingMask: 16usize] };
+        let _: () = unsafe { msg_send![vev, setMaterial: NS_VISUAL_EFFECT_MATERIAL_SIDEBAR] };
+        let _: () = unsafe { msg_send![vev, setState: NS_VISUAL_EFFECT_STATE_ACTIVE] };
+        let _: () =
+            unsafe { msg_send![vev, setBlendingMode: NS_VISUAL_EFFECT_BLENDING_BEHIND_WINDOW] };
+        // NSViewHeightSizable: auto-resize height with superview so the effect
+        // covers the full sidebar on window resize.
+        let _: () = unsafe { msg_send![vev, setAutoresizingMask: NS_VIEW_HEIGHT_SIZABLE] };
 
         // ── Insert behind all existing subviews (index 0 = back of Z-order) ─
         let _: () = unsafe { msg_send![&*content_view, insertSubview: vev, atIndex: 0usize] };
