@@ -1019,10 +1019,21 @@ impl State {
         // We insert an NSVisualEffectView behind the Metal layer covering only the
         // sidebar area. win.transparent=true is required so the Metal layer renders
         // transparent pixels in the sidebar, letting the NSVisualEffectView show.
+        //
+        // SAFETY: this runs inside the winit event handler which is an ObjC block
+        // (extern "C"). Any Rust panic here becomes panic_cannot_unwind → abort().
+        // catch_unwind ensures that ObjC/class-lookup failures disable vibrancy
+        // gracefully instead of crashing the process.
         #[cfg(target_os = "macos")]
         if self.vibrancy_state.is_none() {
             let sidebar_w = self.config.ui.sidebar_width;
-            self.vibrancy_state = Some(apply_sidebar_vibrancy(sidebar_w));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                apply_sidebar_vibrancy(sidebar_w)
+            }));
+            self.vibrancy_state = Some(result.unwrap_or_else(|_| {
+                eprintln!("[vibrancy] panic during init — disabling vibrancy");
+                false
+            }));
         }
 
         let task = match message {
