@@ -853,6 +853,18 @@ impl State {
             .collect()
     }
 
+    /// Returns the hex color used as the left-border accent for a group section.
+    /// Uses the first golem's `color` field in the group so each category
+    /// (orchestrators, workers, tools) gets a visually distinct stripe.
+    /// Falls back to `config.ui.colors.accent` when the group is empty.
+    pub fn group_accent_color<'a>(&'a self, group: &str) -> &'a str {
+        self.golems_in_group(group)
+            .into_iter()
+            .next()
+            .map(|g| g.color.as_str())
+            .unwrap_or(&self.config.ui.colors.accent)
+    }
+
     /// Find the best matching external agent state for a slot label.
     /// Matches by checking if any state file's surface name contains the label (case-insensitive).
     fn agent_state_for_slot(&self, label: &str) -> Option<&agent_state::AgentExternalState> {
@@ -1717,7 +1729,10 @@ impl State {
         let has_golem_presets = !self.config.golem.is_empty();
 
         if has_golem_presets {
-            // Render grouped golem presets
+            // Render grouped golem presets.
+            // Each group is wrapped in a row with a 2px colored accent strip on
+            // the left so categories (Orchestrators / Workers / Tools) are visually
+            // distinct. The accent color comes from the first golem in the group.
             for group_name in &groups {
                 let collapsed = self
                     .collapsed_groups
@@ -1726,6 +1741,9 @@ impl State {
                     .unwrap_or(false);
                 let arrow = if collapsed { ">" } else { "v" };
                 let header_label = format!("{} {}", arrow, group_name.to_uppercase());
+
+                // Accent color: first golem's color, or config accent as fallback.
+                let group_color = parse_hex_color(self.group_accent_color(group_name));
 
                 let group_name_clone = group_name.clone();
                 let group_header = button(
@@ -1747,147 +1765,159 @@ impl State {
                 .width(Length::Fill)
                 .on_press(Message::ToggleGroup(group_name_clone));
 
-                sidebar_content = sidebar_content.push(group_header);
+                // Build the group sub-column: header + golem items (when expanded).
+                let mut group_col = column![group_header].spacing(0.0);
 
-                if collapsed {
-                    continue;
-                }
+                if !collapsed {
+                    let golems = self.golems_in_group(group_name);
+                    for golem in golems {
+                        let golem_color = parse_hex_color(&golem.color);
+                        let golem_name = golem.name.clone();
 
-                let golems = self.golems_in_group(group_name);
-                for golem in golems {
-                    let golem_color = parse_hex_color(&golem.color);
-                    let golem_name = golem.name.clone();
+                        // Check if this golem has a running slot
+                        let running_slot = self
+                            .slots
+                            .iter()
+                            .enumerate()
+                            .find(|(_, s)| s.label == golem.name);
 
-                    // Check if this golem has a running slot
-                    let running_slot = self
-                        .slots
-                        .iter()
-                        .enumerate()
-                        .find(|(_, s)| s.label == golem.name);
-
-                    let (dot_color, label_color, bg, border_color, on_press, slot_idx) =
-                        if let Some((idx, slot)) = running_slot {
-                            let is_active = active_slot == Some(idx);
-                            let is_in_split = !is_active && visible_slots.contains(&idx);
-                            let dc = match slot.status {
-                                SlotStatus::Running => status_running,
-                                SlotStatus::Pending => status_pending,
-                                SlotStatus::Idle => status_idle,
-                            };
-                            let lc = if is_active || is_in_split {
-                                text_tab_active
+                        let (dot_color, label_color, bg, border_color, on_press, slot_idx) =
+                            if let Some((idx, slot)) = running_slot {
+                                let is_active = active_slot == Some(idx);
+                                let is_in_split = !is_active && visible_slots.contains(&idx);
+                                let dc = match slot.status {
+                                    SlotStatus::Running => status_running,
+                                    SlotStatus::Pending => status_pending,
+                                    SlotStatus::Idle => status_idle,
+                                };
+                                let lc = if is_active || is_in_split {
+                                    text_tab_active
+                                } else {
+                                    text_secondary
+                                };
+                                let bg = if is_active {
+                                    bg_tab_active
+                                } else if is_in_split {
+                                    bg_tab_hover
+                                } else {
+                                    iced::Color::TRANSPARENT
+                                };
+                                let bc = if is_active {
+                                    golem_color
+                                } else if is_in_split {
+                                    focus_border
+                                } else {
+                                    iced::Color::TRANSPARENT
+                                };
+                                (dc, lc, bg, bc, Message::SelectTab(idx), Some(idx))
                             } else {
-                                text_secondary
+                                (
+                                    status_idle,
+                                    text_secondary,
+                                    iced::Color::TRANSPARENT,
+                                    iced::Color::TRANSPARENT,
+                                    Message::LaunchGolem(golem_name.clone()),
+                                    None,
+                                )
                             };
-                            let bg = if is_active {
-                                bg_tab_active
-                            } else if is_in_split {
-                                bg_tab_hover
-                            } else {
-                                iced::Color::TRANSPARENT
-                            };
-                            let bc = if is_active {
-                                golem_color
-                            } else if is_in_split {
-                                focus_border
-                            } else {
-                                iced::Color::TRANSPARENT
-                            };
-                            (dc, lc, bg, bc, Message::SelectTab(idx), Some(idx))
+
+                        // Override dot color from external agent state if available
+                        let ext_state = self.agent_state_for_slot(&golem.name);
+                        let dot_color = if let Some(ext) = ext_state {
+                            match ext.status_color_hint() {
+                                "running" => status_running,
+                                "pending" => status_pending,
+                                "error" => status_error,
+                                _ => dot_color,
+                            }
                         } else {
-                            (
-                                status_idle,
-                                text_secondary,
-                                iced::Color::TRANSPARENT,
-                                iced::Color::TRANSPARENT,
-                                Message::LaunchGolem(golem_name.clone()),
-                                None,
-                            )
+                            dot_color
                         };
 
-                    // Override dot color from external agent state if available
-                    let ext_state = self.agent_state_for_slot(&golem.name);
-                    let dot_color = if let Some(ext) = ext_state {
-                        match ext.status_color_hint() {
-                            "running" => status_running,
-                            "pending" => status_pending,
-                            "error" => status_error,
-                            _ => dot_color,
-                        }
-                    } else {
-                        dot_color
-                    };
+                        let icon_text = text(&golem.icon).size(font_tab);
+                        let label_widget = text(&golem.name).size(font_tab).color(label_color);
+                        let dot = text("●").size(STATUS_DOT_SIZE).color(dot_color);
 
-                    let icon_text = text(&golem.icon).size(font_tab);
-                    let label_widget = text(&golem.name).size(font_tab).color(label_color);
-                    let dot = text("●").size(STATUS_DOT_SIZE).color(dot_color);
+                        let top_row = row![
+                            icon_text,
+                            label_widget,
+                            Space::new().width(Length::Fill),
+                            dot
+                        ]
+                        .spacing(SPACING_TIGHT)
+                        .align_y(iced::Alignment::Center);
 
-                    let top_row = row![
-                        icon_text,
-                        label_widget,
-                        Space::new().width(Length::Fill),
-                        dot
-                    ]
-                    .spacing(SPACING_TIGHT)
-                    .align_y(iced::Alignment::Center);
-
-                    // Build tab content: top row + optional subtitle from agent state
-                    let tab_content: iced::Element<'_, Message> = if let Some(ext) = ext_state {
-                        let summary = ext.sidebar_summary();
-                        if summary.is_empty() {
-                            top_row.into()
+                        // Build tab content: top row + optional subtitle from agent state
+                        let tab_content: iced::Element<'_, Message> = if let Some(ext) = ext_state {
+                            let summary = ext.sidebar_summary();
+                            if summary.is_empty() {
+                                top_row.into()
+                            } else {
+                                let subtitle = text(summary).size(font_tiny).color(text_secondary);
+                                column![top_row, subtitle].spacing(1).into()
+                            }
                         } else {
-                            let subtitle = text(summary).size(font_tiny).color(text_secondary);
-                            column![top_row, subtitle].spacing(1).into()
-                        }
-                    } else {
-                        top_row.into()
-                    };
+                            top_row.into()
+                        };
 
-                    let is_bordered = slot_idx.map_or(false, |idx| {
-                        active_slot == Some(idx) || visible_slots.contains(&idx)
-                    });
+                        let is_bordered = slot_idx.map_or(false, |idx| {
+                            active_slot == Some(idx) || visible_slots.contains(&idx)
+                        });
 
-                    let tab_container = container(tab_content)
-                        .style(move |_theme| container::Style {
-                            background: Some(iced::Background::Color(bg)),
-                            border: iced::Border {
-                                color: border_color,
-                                width: if is_bordered { 2.0 } else { 0.0 },
-                                radius: iced::border::radius(0.0)
-                                    .top_right(BORDER_RADIUS)
-                                    .bottom_right(BORDER_RADIUS),
-                            },
-                            ..Default::default()
-                        })
-                        .padding([SPACING_TIGHT, SPACING_NORMAL + 8.0]) // indent under group
-                        .width(Length::Fill);
+                        let tab_container = container(tab_content)
+                            .style(move |_theme| container::Style {
+                                background: Some(iced::Background::Color(bg)),
+                                border: iced::Border {
+                                    color: border_color,
+                                    width: if is_bordered { 2.0 } else { 0.0 },
+                                    radius: iced::border::radius(0.0)
+                                        .top_right(BORDER_RADIUS)
+                                        .bottom_right(BORDER_RADIUS),
+                                },
+                                ..Default::default()
+                            })
+                            .padding([SPACING_TIGHT, SPACING_NORMAL + 8.0]) // indent under group
+                            .width(Length::Fill);
 
-                    let tab_element: iced::Element<'_, Message> = if let Some(idx) = slot_idx {
-                        mouse_area(
+                        let tab_element: iced::Element<'_, Message> = if let Some(idx) = slot_idx {
+                            mouse_area(
+                                button(tab_container)
+                                    .style(|_theme, _status| iced::widget::button::Style {
+                                        background: None,
+                                        ..Default::default()
+                                    })
+                                    .padding(0)
+                                    .on_press(on_press),
+                            )
+                            .on_middle_press(Message::CloseTab(idx))
+                            .into()
+                        } else {
                             button(tab_container)
                                 .style(|_theme, _status| iced::widget::button::Style {
                                     background: None,
                                     ..Default::default()
                                 })
                                 .padding(0)
-                                .on_press(on_press),
-                        )
-                        .on_middle_press(Message::CloseTab(idx))
-                        .into()
-                    } else {
-                        button(tab_container)
-                            .style(|_theme, _status| iced::widget::button::Style {
-                                background: None,
-                                ..Default::default()
-                            })
-                            .padding(0)
-                            .on_press(on_press)
-                            .into()
-                    };
+                                .on_press(on_press)
+                                .into()
+                        };
 
-                    sidebar_content = sidebar_content.push(tab_element);
+                        group_col = group_col.push(tab_element);
+                    }
                 }
+
+                // 2px accent strip on the left edge of the group section.
+                let accent_strip = container(Space::new())
+                    .width(2.0)
+                    .height(Length::Fill)
+                    .style(move |_theme| container::Style {
+                        background: Some(iced::Background::Color(group_color)),
+                        ..Default::default()
+                    });
+
+                let group_row = row![accent_strip, group_col.width(Length::Fill)]
+                    .align_y(iced::Alignment::Start);
+                sidebar_content = sidebar_content.push(group_row);
             }
 
             // Separator before ad-hoc tabs
@@ -2583,6 +2613,29 @@ mod tests {
         let workers = state.golems_in_group("workers");
         assert_eq!(workers.len(), 1);
         assert_eq!(workers[0].name, "brainClaude");
+    }
+
+    // ── Phase E: Group Accent Color Tests ────────────────────────────────────
+
+    #[test]
+    fn group_accent_color_uses_first_golem_color() {
+        let state = state_with_golems();
+        // Each canonical group's accent = the first golem's color in that group.
+        assert_eq!(state.group_accent_color("orchestrators"), "#7C3AED");
+        assert_eq!(state.group_accent_color("workers"), "#06B6D4");
+        assert_eq!(state.group_accent_color("tools"), "#6B7280");
+    }
+
+    #[test]
+    fn group_accent_color_falls_back_to_config_accent_for_empty_group() {
+        let mut state = State::new(vec!["echo".into()]);
+        // Register a group with no matching golems → should fall back to accent.
+        state
+            .config
+            .groups
+            .insert("empty".into(), vec!["nobody".into()]);
+        let accent = state.config.ui.colors.accent.clone();
+        assert_eq!(state.group_accent_color("empty"), accent.as_str());
     }
 
     #[test]
