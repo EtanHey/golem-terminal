@@ -114,7 +114,7 @@ Terminal rendering uses [iced_term](https://github.com/EtanHey/iced_term) (a for
 ## Testing
 
 ```bash
-# Unit tests (71 tests, no display needed):
+# Unit tests (76 tests, no display needed):
 cargo test --features gui --bin golem-terminal
 
 # E2E tests (5 tests, needs a display context):

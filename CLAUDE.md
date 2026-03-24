@@ -58,7 +58,7 @@ Tab-based terminal multiplexer for Claude Code orchestration. Built with Rust + 
 ## Testing
 
 ```bash
-# Unit tests (71 tests, no display needed):
+# Unit tests (76 tests, no display needed):
 cargo test --features gui --bin golem-terminal
 
 # E2E tests (needs display):
