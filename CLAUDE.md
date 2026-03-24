@@ -6,6 +6,8 @@ Tab-based terminal multiplexer for Claude Code orchestration. Built with Rust + 
 
 - **src/main.rs** — CLI entry (wrap, run, ui subcommands)
 - **src/ui.rs** — Iced GUI: sidebar navigation, iced_term terminal panels, split screen, focus model
+- **src/config.rs** — TOML config via Figment (defaults → file → env → CLI), hot-reload via notify
+- **src/agent_state.rs** — Reads live agent state from /tmp/golem-agents/*.json for sidebar display
 - **src/session.rs** — PTY lifecycle for wrap/run CLI modes (not used by GUI — iced_term manages its own PTY)
 - **src/pty.rs** — Raw mode guard, terminal size, interactive PTY proxy
 - **src/test_harness.rs** — UDS JSON protocol for E2E test control
@@ -56,7 +58,7 @@ Tab-based terminal multiplexer for Claude Code orchestration. Built with Rust + 
 ## Testing
 
 ```bash
-# Unit tests (25 tests, no display needed):
+# Unit tests (71 tests, no display needed):
 cargo test --features gui --bin golem-terminal
 
 # E2E tests (needs display):
@@ -78,5 +80,5 @@ cargo test --features gui --test e2e_gui
 
 - ~~`send_input` UDS command is no-op~~ **FIXED** — forked iced_term (EtanHey/iced_term), made backend module pub. send_input now works.
 - ~~Pty::drop() blocks synchronously~~ **FIXED** — fork moves PTY shutdown to background thread, UI stays responsive.
-- Vibrancy/Liquid Glass deferred — requires objc FFI for sidebar-only NSVisualEffectView
-- Tab groups not yet implemented — all tabs in single "AGENTS" group
+- ~~Vibrancy/Liquid Glass deferred~~ **IMPLEMENTED** — sidebar-only NSVisualEffectView via objc2 FFI, sibling VEV under Metal layer (macOS 15+). PRs #10-#13.
+- ~~Tab groups not yet implemented~~ **IMPLEMENTED** — ordered group display (orchestrators → workers → tools → custom → OTHER), collapsible sections, per-group accent colors.
