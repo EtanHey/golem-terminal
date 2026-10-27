@@ -1,0 +1,25 @@
+name: docs.local guard
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  docs-local-guard:
+    name: No new tracked docs.local
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Guard against newly tracked docs.local paths
+        env:
+          RANGE_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          RANGE_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        # Unusable push-before values fall back to a full-history scan in the guard.
+        run: bash scripts/guard-no-docslocal.sh --range "$RANGE_BASE..$RANGE_HEAD"
